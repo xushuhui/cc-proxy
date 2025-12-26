@@ -1,0 +1,25 @@
+{
+  "port": 3456,
+  "backends": [
+    {
+      "name": "Anthropic Official",
+      "base_url": "https://api.anthropic.com",
+      "token": "sk-ant-api03-your-key-1",
+      "enabled": true
+    },
+    {
+      "name": "Backup Provider",
+      "base_url": "https://api.backup.example.com",
+      "token": "your-backup-key",
+      "enabled": true
+    }
+  ],
+  "retry": {
+    "max_attempts": 3,
+    "timeout_seconds": 300
+  },
+  "health_check": {
+    "enabled": true,
+    "interval_seconds": 60
+  }
+}
