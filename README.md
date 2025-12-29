@@ -10,7 +10,7 @@ A lightweight Claude API reverse proxy with automatic failover support for multi
 - **Smart Health Checking**: Uses HTTP requests to periodically check backend availability, automatically skips unhealthy backends
 - **Detailed Error Logging**: All non-2xx responses are logged with detailed error information, supports automatic gzip decompression
 - **Transparent Proxy**: Fully forwards all HTTP requests and responses
-- **Flexible Configuration**: YAML configuration file, supports multiple backends, timeout, retry settings
+- **Flexible Configuration**: JSON configuration file, supports multiple backends, timeout, retry settings
 - **Zero Dependencies**: Single binary after compilation, no additional dependencies required
 - **Secure Logging**: Tokens only show first and last 4 characters to avoid leaking complete keys
 
