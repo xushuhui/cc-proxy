@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -35,18 +34,12 @@ type Config struct {
 		MaxAttempts int `json:"max_attempts"`
 		Timeout     int `json:"timeout_seconds"`
 	} `json:"retry"`
-	HealthCheck struct {
-		Enabled  bool `json:"enabled"`
-		Interval int  `json:"interval_seconds"`
-	} `json:"health_check"`
 }
 
 // ProxyServer 代理服务器
 type ProxyServer struct {
-	config      *Config
-	client      *http.Client
-	healthMutex sync.RWMutex
-	healthMap   map[string]bool
+	config *Config
+	client *http.Client
 }
 
 // NewProxyServer 创建代理服务器实例
@@ -83,116 +76,9 @@ func NewProxyServer(configPath string) (*ProxyServer, error) {
 		client: &http.Client{
 			Timeout: time.Duration(config.Retry.Timeout) * time.Second,
 		},
-		healthMap: make(map[string]bool),
-	}
-
-	// 初始化所有后端为健康状态
-	for _, backend := range config.Backends {
-		if backend.Enabled {
-			server.healthMap[backend.Name] = true
-		}
-	}
-
-	// 启动健康检查
-	if config.HealthCheck.Enabled {
-		go server.startHealthCheck()
 	}
 
 	return server, nil
-}
-
-// isHealthy 检查后端是否健康
-func (ps *ProxyServer) isHealthy(name string) bool {
-	ps.healthMutex.RLock()
-	defer ps.healthMutex.RUnlock()
-	return ps.healthMap[name]
-}
-
-// setHealth 设置后端健康状态
-func (ps *ProxyServer) setHealth(name string, healthy bool) {
-	ps.healthMutex.Lock()
-	defer ps.healthMutex.Unlock()
-	ps.healthMap[name] = healthy
-}
-
-// startHealthCheck 定期健康检查
-func (ps *ProxyServer) startHealthCheck() {
-	interval := time.Duration(ps.config.HealthCheck.Interval) * time.Second
-	if interval == 0 {
-		interval = 60 * time.Second
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		for _, backend := range ps.config.Backends {
-			if !backend.Enabled {
-				continue
-			}
-
-			go func(b Backend) {
-				healthy := ps.checkBackend(b)
-				ps.setHealth(b.Name, healthy)
-				if healthy {
-					log.Printf("[健康检查] %s ✓ 健康", b.Name)
-				} else {
-					log.Printf("[健康检查] %s ✗ 不可用", b.Name)
-				}
-			}(backend)
-		}
-	}
-}
-
-// checkBackend 检查单个后端是否可用
-func (ps *ProxyServer) checkBackend(backend Backend) bool {
-	// 使用 HTTP 请求检查（更准确地反映 API 可用性）
-	// 首先尝试 /health 端点，如果失败则尝试实际的 API 端点
-
-	healthURL := backend.BaseURL + "/v1/models"
-
-	// 创建健康检查请求
-	req, err := http.NewRequest("GET", healthURL, nil)
-	if err != nil {
-		log.Printf("[健康检查] %s - 创建请求失败: %v", backend.Name, err)
-		return false
-	}
-
-	// 设置认证头
-	req.Header.Set("Authorization", "Bearer "+backend.Token)
-
-	// 创建专用的健康检查客户端（超时时间较短）
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
-
-	// 发送请求
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[健康检查] %s - 请求失败: %v", backend.Name, err)
-		return false
-	}
-	defer resp.Body.Close()
-
-	// 读取响应体（用于日志，自动处理 gzip）
-	bodyBytes, readErr := readResponseBody(resp)
-	if readErr != nil {
-		log.Printf("[健康检查] %s - 读取响应失败: %v", backend.Name, readErr)
-		return false
-	}
-	// 检查状态码
-	if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-		// 2xx, 3xx, 4xx 都认为服务是可用的（4xx 表示服务在线但请求有问题）
-		return true
-	}
-
-	// 5xx 错误表示服务不可用
-	bodyStr := string(bodyBytes)
-	if len(bodyStr) > 200 {
-		bodyStr = bodyStr[:200] + "..."
-	}
-	log.Printf("[健康检查] %s - HTTP %d - 响应: %s", backend.Name, resp.StatusCode, bodyStr)
-	return false
 }
 
 // ServeHTTP 处理 HTTP 请求
@@ -217,12 +103,6 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 跳过不健康的后端（如果启用了健康检查）
-		if ps.config.HealthCheck.Enabled && !ps.isHealthy(backend.Name) {
-			log.Printf("[跳过] %s (不健康)", backend.Name)
-			continue
-		}
-
 		attemptCount++
 
 		// 构建目标 URL 用于日志
@@ -242,10 +122,7 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			lastErr = err
 			log.Printf("[失败 #%d] %s - %s - %v", attemptCount, backend.Name, targetURL, err)
-			// 标记为不健康
-			if ps.config.HealthCheck.Enabled {
-				ps.setHealth(backend.Name, false)
-			}
+
 			continue
 		}
 
@@ -387,7 +264,6 @@ func main() {
 	}
 	log.Printf("最大重试次数: %d", server.config.Retry.MaxAttempts)
 	log.Printf("请求超时: %d 秒", server.config.Retry.Timeout)
-	log.Printf("健康检查: %v", server.config.HealthCheck.Enabled)
 
 	// 启动 HTTP 服务器
 	addr := fmt.Sprintf(":%d", server.config.Port)
@@ -416,7 +292,7 @@ func main() {
 	log.Println("\n收到关闭信号，正在优雅关闭服务器...")
 
 	// 设置 10 秒超时等待现有请求完成
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
