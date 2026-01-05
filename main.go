@@ -24,6 +24,7 @@ type Backend struct {
 	BaseURL string `json:"base_url"`
 	Enabled bool   `json:"enabled"`
 	Token   string `json:"token"`
+	Model   string `json:"model,omitempty"` // 可选：覆盖请求中的 model 字段
 }
 
 // Config 代表配置文件结构
@@ -92,12 +93,17 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	// 记录请求开始
-	log.Printf("[请求开始] %s %s - 将尝试 %d 个后端", r.Method, r.URL.Path, len(ps.config.Backends))
+	backendCount := len(ps.config.Backends)
+	log.Printf("[请求开始] %s %s - 将尝试 %d 个后端", r.Method, r.URL.Path, backendCount)
 
 	// 尝试所有启用的后端
 	var lastErr error
 	attemptCount := 0
-	for _, backend := range ps.config.Backends {
+
+	backends := make([]Backend, len(ps.config.Backends))
+	copy(backends, ps.config.Backends)
+
+	for _, backend := range backends {
 		if !backend.Enabled {
 			log.Printf("[跳过] %s (已禁用)", backend.Name)
 			continue
@@ -152,6 +158,18 @@ func (ps *ProxyServer) forwardRequest(backend Backend, originalReq *http.Request
 	targetURL.Path = originalReq.URL.Path
 	targetURL.RawQuery = originalReq.URL.RawQuery
 
+	// 如果配置了 model，则覆盖请求体中的 model 字段
+	if backend.Model != "" && len(bodyBytes) > 0 {
+		var bodyMap map[string]any
+		if err := json.Unmarshal(bodyBytes, &bodyMap); err == nil {
+			bodyMap["model"] = backend.Model
+			if modifiedBody, err := json.Marshal(bodyMap); err == nil {
+				bodyBytes = modifiedBody
+				log.Printf("[模型覆盖] %s - 使用配置的 model: %s", backend.Name, backend.Model)
+			}
+		}
+	}
+
 	// 创建新请求
 	req, err := http.NewRequest(originalReq.Method, targetURL.String(), bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -192,8 +210,8 @@ func (ps *ProxyServer) forwardRequest(backend Backend, originalReq *http.Request
 
 		log.Printf("[错误详情] %s - HTTP %d - 响应: %s", backend.Name, resp.StatusCode, bodyStr)
 
-		// 只有 5xx 错误才触发故障转移
-		if resp.StatusCode >= 500 {
+		// 5xx 错误或 429 错误触发故障转移
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
 			return nil, fmt.Errorf("后端返回错误: HTTP %d", resp.StatusCode)
 		}
 

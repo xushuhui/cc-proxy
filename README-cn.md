@@ -6,13 +6,13 @@
 
 ## 功能特性
 
-- **自动故障转移**：当主 API key 失败时，自动尝试备用 key（仅 5xx 错误触发）
-- **智能健康检查**：使用 HTTP 请求定期检测后端可用性，自动跳过不健康的后端
+- **自动故障转移**：当主 API key 失败时，自动尝试备用 key（仅 5xx/429 错误触发）
 - **详细错误日志**：所有非 2xx 响应都会记录详细的错误信息，支持 gzip 自动解压
 - **透明代理**：完整转发所有 HTTP 请求和响应
 - **配置灵活**：JSON 配置文件，支持多个后端、超时、重试等配置
 - **零依赖**：编译后单个二进制文件，无需额外依赖
 - **安全日志**：Token 仅显示前后 4 个字符，避免泄露完整密钥
+- **模型覆盖**：可选的按后端模型覆盖，强制使用特定模型版本
 
 ## 快速开始
 
@@ -35,7 +35,8 @@ go build -o cc-proxy
       "name": "Anthropic Official",
       "base_url": "https://api.anthropic.com",
       "token": "sk-ant-api03-your-key-1",
-      "enabled": true
+      "enabled": true,
+      "model": "claude-3-5-sonnet-20241022"
     },
     {
       "name": "Backup Provider",
@@ -47,15 +48,13 @@ go build -o cc-proxy
   "retry": {
     "max_attempts": 3,
     "timeout_seconds": 30
-  },
-  "health_check": {
-    "enabled": true,
-    "interval_seconds": 60
   }
 }
 ```
 
-**重要**：配置字段是 `token` 而不是 `api_key`。
+**重要**：
+- 配置字段是 `token` 而不是 `api_key`
+- `model` 字段是可选的 - 如果指定，代理会覆盖请求体中的 model 字段
 
 ### 3. 启动代理
 
@@ -72,7 +71,6 @@ go build -o cc-proxy
 2024/12/26 12:00:00   2. Backup Provider - https://api.backup.example.com [启用]
 2024/12/26 12:00:00 最大重试次数: 3
 2024/12/26 12:00:00 请求超时: 30 秒
-2024/12/26 12:00:00 健康检查: true
 
 2024/12/26 12:00:00 ✓ 代理服务器运行在 http://localhost:3456
 2024/12/26 12:00:00 ✓ 配置 Claude Code: export ANTHROPIC_BASE_URL=http://localhost:3456
@@ -109,8 +107,11 @@ claude
 | `base_url` | API 基础 URL | 是 |
 | `token` | API Token（注意是 token 不是 api_key） | 是 |
 | `enabled` | 是否启用 | 是 |
+| `model` | 模型覆盖（可选） | 否 |
 
-后端按配置顺序优先使用，失败后自动尝试下一个。**注意**：只有 5xx 错误和网络错误才会触发故障转移，4xx 错误（如 403、429）会直接返回给客户端。
+后端按配置顺序优先使用，失败后自动尝试下一个。**注意**：只有 5xx/429 错误和网络错误才会触发故障转移，其他 4xx 错误（如 403）会直接返回给客户端。
+
+当指定 `model` 时，代理会在转发到后端之前替换请求体中的 "model" 字段。这对于强制使用特定模型版本很有用。
 
 ### 重试配置
 
@@ -119,26 +120,16 @@ claude
 | `retry.max_attempts` | 最大重试次数 | 3 |
 | `retry.timeout_seconds` | 单次请求超时（秒） | 30 |
 
-### 健康检查配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `health_check.enabled` | 是否启用健康检查 | false |
-| `health_check.interval_seconds` | 检查间隔（秒） | 60 |
-
-启用健康检查后，代理会定期向后端发送 HTTP GET 请求到 `/v1/models` 端点，使用实际的认证 token。2xx/3xx/4xx 响应视为健康，只有 5xx 错误才标记为不健康。自动跳过不健康的后端。
-
-**注意**：`/v1/models` 端点通常由 OpenAI 兼容的 Claude API 代理提供。如果你的后端不支持此端点，可能会返回 404，但仍会被视为健康（因为服务在线）。
-
 ## 工作原理
 
 1. **请求接收**：代理接收 Claude Code 的 API 请求
-2. **后端选择**：按配置顺序选择第一个启用且健康的后端
-3. **请求转发**：将请求转发到选中的后端，替换 Authorization 头为后端的 token
-4. **故障转移**：如果请求失败（5xx 错误或网络错误），自动尝试下一个后端
-5. **响应返回**：将后端响应完整返回给客户端
+2. **后端选择**：按配置顺序选择第一个启用的后端
+3. **模型覆盖**：如果后端配置了 `model`，替换请求体中的 model 字段
+4. **请求转发**：将请求转发到选中的后端，替换 Authorization 头为后端的 token
+5. **故障转移**：如果请求失败（5xx/429 错误或网络错误），自动尝试下一个后端
+6. **响应返回**：将后端响应完整返回给客户端
 
-**重要**：只有 5xx 错误和网络错误才触发故障转移。3xx/4xx 错误（如 403 认证失败、429 限流）会直接返回给客户端，不会尝试其他后端。
+**重要**：只有 5xx/429 错误和网络错误才触发故障转移。其他 3xx/4xx 错误（如 403 认证失败）会直接返回给客户端，不会尝试其他后端。
 
 ```
 Claude Code → 本地代理 → 后端1 (500 错误)
@@ -155,18 +146,11 @@ Claude Code → 本地代理 → 后端1 (500 错误)
 ```
 [请求开始] POST /v1/messages - 将尝试 3 个后端
 [尝试 #1] Anthropic Official - POST https://api.anthropic.com/v1/messages (token: sk-a...xyz1)
+[模型覆盖] Anthropic Official - 使用配置的 model: claude-3-5-sonnet-20241022
 [错误详情] Anthropic Official - HTTP 500 - 响应: {"error":{"type":"internal_error","message":"Service temporarily unavailable"}}
 [失败 #1] Anthropic Official - 后端返回错误: HTTP 500
 [尝试 #2] Backup Provider - POST https://api.backup.com/v1/messages (token: sk-b...abc2)
 [成功 #2] Backup Provider - HTTP 200
-```
-
-### 健康检查日志
-
-```
-[健康检查] Anthropic Official ✓ 健康
-[健康检查] Backup Provider - HTTP 500 - 响应: {"error":"service unavailable"}
-[健康检查] Backup Provider ✗ 不可用
 ```
 
 ### 日志特性
@@ -174,7 +158,8 @@ Claude Code → 本地代理 → 后端1 (500 错误)
 - **Token 安全**：只显示 token 的前 4 和后 4 个字符（如 `sk-a...xyz1`），避免泄露完整密钥
 - **尝试编号**：显示 `#1`、`#2` 等，清楚看到尝试了哪些后端
 - **错误详情**：所有非 2xx 响应都会显示完整的错误信息（自动解压 gzip）
-- **跳过原因**：显示后端被跳过的原因（已禁用/不健康）
+- **跳过原因**：显示后端被跳过的原因（已禁用）
+- **模型覆盖**：显示请求模型被后端配置覆盖的情况
 
 ## 高级用法
 
@@ -228,7 +213,6 @@ pkill cc-proxy
 **可能原因**：
 1. **多个后端轮换使用**：第一个后端 token 无效返回 403，但 403 不触发故障转移，所以直接返回给客户端
 2. **Token 限流**：某个 token 超过限流后返回 403，等待一段时间后恢复
-3. **健康检查影响**：某个后端被标记为不健康后跳过，使用另一个后端
 
 **排查方法**：
 1. 查看日志中的 `[尝试 #N]` 行，检查 token 预览（如 `sk-a...xyz1`）
@@ -236,7 +220,7 @@ pkill cc-proxy
 3. 如果不同请求使用了不同的 token，说明在多个后端间切换
 
 **解决方案**：
-- 启用健康检查，自动跳过返回 403 的后端（需要持续失败才会标记为不健康）
+- 在 config.json 中禁用无效 token 的后端并重启代理
 - 检查并更新无效的 token
 - 如果是限流问题，考虑增加更多后端或降低请求频率
 
@@ -255,22 +239,6 @@ pkill cc-proxy
 2. 检查网络延迟
 3. 查看后端是否响应缓慢
 
-### 问题：健康检查一直失败
-
-**可能原因**：
-1. 后端不支持 `/v1/models` 端点（返回 404，但这应该被视为健康）
-2. Token 无效（返回 403，但这应该被视为健康）
-3. 后端真的不可用（返回 5xx）
-
-**排查方法**：
-- 查看 `[健康检查]` 日志中的 HTTP 状态码和响应内容
-- 只有 5xx 错误才会标记为不健康
-- 如果看到 404 或 403 但仍标记为不健康，可能是代码 bug
-
-**解决方案**：
-- 如果后端不支持 `/v1/models`，404 响应仍会被视为健康
-- 如果健康检查不准确，可以禁用它（`enabled: false`）
-
 ## 性能优化
 
 - **内存占用**：约 10-20MB
@@ -286,9 +254,9 @@ pkill cc-proxy
 - **特性**：
   - 零外部依赖
   - 自动 gzip 解压
-  - 并发安全的健康状态管理
   - 优雅关闭支持
   - 不设置 API 版本头，兼容各种后端
+  - 按后端模型覆盖支持
 
 ## 许可证
 
