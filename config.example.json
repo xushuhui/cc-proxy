@@ -2,24 +2,37 @@
   "port": 3456,
   "backends": [
     {
-      "name": "Anthropic Official",
-      "base_url": "https://api.anthropic.com",
-      "token": "sk-ant-api03-your-key-1",
+      "name": "backend-1",
+      "base_url": "https://api.example1.com",
+      "token": "sk-ant-xxx",
       "enabled": true
     },
     {
-      "name": "Backup Provider",
-      "base_url": "https://api.backup.example.com",
-      "token": "your-backup-key",
-      "enabled": true
+      "name": "backend-2",
+      "base_url": "https://api.example2.com",
+      "token": "sk-ant-yyy",
+      "enabled": true,
+      "model": "claude-3-5-sonnet-20241022"
+    },
+    {
+      "name": "backend-3",
+      "base_url": "https://api.example3.com",
+      "token": "sk-ant-zzz",
+      "enabled": false
     }
   ],
   "retry": {
     "max_attempts": 3,
-    "timeout_seconds": 300
+    "timeout_seconds": 30
   },
-  "health_check": {
-    "enabled": true,
-    "interval_seconds": 60
+  "failover": {
+    "circuit_breaker": {
+      "failure_threshold": 3,
+      "open_timeout_seconds": 30,
+      "half_open_requests": 1
+    },
+    "rate_limit": {
+      "cooldown_seconds": 60
+    }
   }
 }

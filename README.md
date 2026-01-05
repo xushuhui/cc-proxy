@@ -2,11 +2,14 @@
 
 A lightweight Claude API reverse proxy with automatic failover support for multiple API keys. When one backend fails, it automatically switches to the next available backend, completely transparent to clients.
 
-[中文文档](README-cn.md)
+[中文文档](README.zh.md)
 
 ## Features
 
 - **Automatic Failover**: Automatically tries backup keys when primary API key fails (only 5xx/429 errors trigger failover)
+- **Circuit Breaker**: Smart circuit breaker prevents repeated requests to failing backends
+- **Rate Limit Handling**: Intelligent 429 error handling with cooldown and Retry-After header support
+- **Timeout Handling**: Request timeouts trigger automatic failover to next backend
 - **Detailed Error Logging**: All non-2xx responses are logged with detailed error information, supports automatic gzip decompression
 - **Transparent Proxy**: Fully forwards all HTTP requests and responses
 - **Flexible Configuration**: JSON configuration file, supports multiple backends, timeout, retry settings
@@ -29,14 +32,14 @@ Edit `config.json` file to configure your API tokens and backend addresses:
 
 ```json
 {
-  "port": 3456,
+  "port": 3456,  // Proxy server listening port
   "backends": [
     {
-      "name": "Anthropic Official",
-      "base_url": "https://api.anthropic.com",
-      "token": "sk-ant-api03-your-key-1",
-      "enabled": true,
-      "model": "claude-3-5-sonnet-20241022"
+      "name": "Anthropic Official",      // Backend name (for logging)
+      "base_url": "https://api.anthropic.com",  // API base URL
+      "token": "sk-ant-api03-your-key-1",       // API token (not api_key!)
+      "enabled": true,                          // Whether this backend is enabled
+      "model": "claude-3-5-sonnet-20241022"    // (Optional) Override model in requests
     },
     {
       "name": "Backup Provider",
@@ -46,8 +49,18 @@ Edit `config.json` file to configure your API tokens and backend addresses:
     }
   ],
   "retry": {
-    "max_attempts": 3,
-    "timeout_seconds": 30
+    "max_attempts": 3,        // Maximum retry attempts (unused in current version)
+    "timeout_seconds": 30     // Request timeout in seconds
+  },
+  "failover": {
+    "circuit_breaker": {
+      "failure_threshold": 3,       // Number of consecutive failures to trigger circuit breaker
+      "open_timeout_seconds": 30,   // How long circuit stays open (seconds)
+      "half_open_requests": 1       // Number of test requests in half-open state
+    },
+    "rate_limit": {
+      "cooldown_seconds": 60        // Cooldown time after 429 rate limit error (seconds)
+    }
   }
 }
 ```
@@ -55,6 +68,7 @@ Edit `config.json` file to configure your API tokens and backend addresses:
 **Important**:
 - The configuration field is `token`, not `api_key`
 - The `model` field is optional - if specified, the proxy will override the model in the request body
+- The `failover` section is optional - defaults will be used if not specified
 
 ### 3. Start Proxy
 
@@ -64,16 +78,18 @@ Edit `config.json` file to configure your API tokens and backend addresses:
 
 Example output:
 ```
-2024/12/26 12:00:00 Claude API Failover Proxy Starting...
-2024/12/26 12:00:00 Listening Port: 3456
-2024/12/26 12:00:00 Configured Backends:
-2024/12/26 12:00:00   1. Anthropic Official - https://api.anthropic.com [Enabled]
-2024/12/26 12:00:00   2. Backup Provider - https://api.backup.example.com [Enabled]
-2024/12/26 12:00:00 Max Retry Attempts: 3
-2024/12/26 12:00:00 Request Timeout: 30 seconds
+2024/12/26 12:00:00 Claude API 故障转移代理启动中...
+2024/12/26 12:00:00 监听端口: 3456
+2024/12/26 12:00:00 配置的后端:
+2024/12/26 12:00:00   1. Anthropic Official - https://api.anthropic.com [启用]
+2024/12/26 12:00:00   2. Backup Provider - https://api.backup.example.com [启用]
+2024/12/26 12:00:00 最大重试次数: 3
+2024/12/26 12:00:00 请求超时: 30 秒
+2024/12/26 12:00:00 熔断配置: 连续失败 3 次触发,熔断 30 秒
+2024/12/26 12:00:00 限流配置: 429 错误后冷却 60 秒
 
-2024/12/26 12:00:00 ✓ Proxy server running at http://localhost:3456
-2024/12/26 12:00:00 ✓ Configure Claude Code: export ANTHROPIC_BASE_URL=http://localhost:3456
+2024/12/26 12:00:00 ✓ 代理服务器运行在 http://localhost:3456
+2024/12/26 12:00:00 ✓ 配置 Claude Code: export ANTHROPIC_BASE_URL=http://localhost:3456
 ```
 
 ### 4. Configure Claude Code
@@ -117,24 +133,53 @@ When `model` is specified, the proxy will replace the "model" field in the reque
 
 | Config | Description | Default |
 |--------|-------------|---------|
-| `retry.max_attempts` | Maximum retry attempts | 3 |
+| `retry.max_attempts` | Maximum retry attempts (unused in current version) | 3 |
 | `retry.timeout_seconds` | Single request timeout (seconds) | 30 |
+
+### Failover Configuration
+
+The `failover` section configures circuit breaker and rate limit handling. All fields are optional with sensible defaults.
+
+| Config | Description | Default |
+|--------|-------------|---------|
+| `failover.circuit_breaker.failure_threshold` | Consecutive failures to trigger circuit breaker | 3 |
+| `failover.circuit_breaker.open_timeout_seconds` | How long circuit stays open before testing recovery (seconds) | 30 |
+| `failover.circuit_breaker.half_open_requests` | Number of test requests allowed in half-open state | 1 |
+| `failover.rate_limit.cooldown_seconds` | Cooldown time after 429 rate limit (seconds) | 60 |
+
+**Circuit Breaker States**:
+- **Closed (Normal)**: All requests go through normally
+- **Open (Circuit Tripped)**: Backend is skipped after N consecutive failures
+- **Half-Open (Testing)**: After timeout expires, allows limited test requests to check if backend recovered
 
 ## How It Works
 
 1. **Request Reception**: Proxy receives Claude Code API requests
-2. **Backend Selection**: Selects first enabled backend in order
-3. **Model Override**: If backend has `model` configured, replaces the model field in request body
-4. **Request Forwarding**: Forwards request to selected backend, replaces Authorization header with backend's token
-5. **Failover**: If request fails (5xx/429 error or network error), automatically tries next backend
-6. **Response Return**: Returns backend response completely to client
+2. **Backend Selection**: Selects backends based on priority (normal > rate-limited > circuit-broken)
+3. **Circuit Breaker Check**: Skips backends in circuit-open state
+4. **Model Override**: If backend has `model` configured, replaces the model field in request body
+5. **Request Forwarding**: Forwards request to selected backend, replaces Authorization header with backend's token
+6. **Error Handling**:
+   - **5xx errors**: Record failure, trigger circuit breaker if threshold reached, try next backend
+   - **429 rate limit**: Record rate limit timestamp, lower priority for cooldown period, try next backend
+   - **Timeout**: Record failure, try next backend
+   - **401/403**: Return immediately without retry (authentication error)
+   - **Other 4xx**: Return immediately without retry (client error)
+7. **Circuit Breaker Recovery**: After timeout, backend enters half-open state for testing
+8. **Response Return**: Returns backend response completely to client
 
-**Important**: Only 5xx/429 errors and network errors trigger failover. Other 3xx/4xx errors (like 403 authentication failure) are returned directly to the client without trying other backends.
+**Important**: Only 5xx/429 errors, timeouts, and network errors trigger failover. Other 3xx/4xx errors (like 403 authentication failure) are returned directly to the client without trying other backends.
 
 ```
-Claude Code → Local Proxy → Backend1 (500 error)
-                     ↓
-                    Backend2 (success) → Response
+Request → Priority Sort (normal > rate-limited > circuit-broken)
+       ↓
+   Backend1 (circuit open - skip)
+       ↓
+   Backend2 (500 error → record failure → try next)
+       ↓
+   Backend3 (429 → record rate limit → try next)
+       ↓
+   Backend4 (success) → Response
 ```
 
 ## Logging
@@ -144,13 +189,35 @@ The proxy outputs detailed request logs to help you understand the request proce
 ### Request Processing Logs
 
 ```
-[Request Start] POST /v1/messages - Will try 3 backends
-[Attempt #1] Anthropic Official - POST https://api.anthropic.com/v1/messages (token: sk-a...xyz1)
-[Model Override] Anthropic Official - Using configured model: claude-3-5-sonnet-20241022
-[Error Details] Anthropic Official - HTTP 500 - Response: {"error":{"type":"internal_error","message":"Service temporarily unavailable"}}
-[Failed #1] Anthropic Official - Backend returned error: HTTP 500
-[Attempt #2] Backup Provider - POST https://api.backup.com/v1/messages (token: sk-b...abc2)
-[Success #2] Backup Provider - HTTP 200
+[请求开始] POST /v1/messages - 配置了 3 个后端
+[跳过] Backend1 - 熔断中 (还需 25 秒)
+[尝试 #1] Backend2 - POST https://api.anthropic.com/v1/messages (token: sk-a...xyz1)
+[模型覆盖] Backend2 - 使用配置的模型: claude-3-5-sonnet-20241022
+[错误详情] Backend2 - HTTP 500 - 响应: {"error":{"type":"internal_error","message":"Service temporarily unavailable"}}
+[失败 #1] Backend2 - 后端返回错误: HTTP 500
+[熔断触发] Backend2 - 连续失败 3 次,熔断 30 秒 (HTTP 500)
+[尝试 #2] Backend3 - POST https://api.backup.com/v1/messages (token: sk-b...abc2)
+[成功 #2] Backend3 - HTTP 200
+```
+
+**Circuit Breaker Logs**:
+```
+[熔断触发] Backend1 - 连续失败 3 次,熔断 30 秒 (HTTP 502)
+[跳过] Backend1 - 熔断中 (还需 25 秒)
+[尝试 #1] Backend1 - ... [熔断测试 1/1]
+[熔断恢复] Backend1 - 后端已恢复正常
+```
+
+**Rate Limit Logs**:
+```
+[限流记录] Backend2 - 触发 429,Retry-After: 60 秒
+[限流记录] Backend3 - 触发 429,冷却 60 秒
+```
+
+**Timeout Logs**:
+```
+[超时] Backend1 - 请求超时 (30 秒)
+[失败 #1] Backend1 - ... context deadline exceeded
 ```
 
 ### Log Features
@@ -158,8 +225,11 @@ The proxy outputs detailed request logs to help you understand the request proce
 - **Token Security**: Only shows first 4 and last 4 characters of token (e.g., `sk-a...xyz1`) to avoid leaking complete keys
 - **Attempt Numbering**: Shows `#1`, `#2`, etc., clearly see which backends were tried
 - **Error Details**: All non-2xx responses show complete error information (automatically decompresses gzip)
-- **Skip Reason**: Shows reason why backend was skipped (disabled)
+- **Skip Reason**: Shows reason why backend was skipped (熔断中/半开测试中/禁用)
 - **Model Override**: Shows when request model is overridden by backend configuration
+- **Circuit Breaker Events**: Logs when circuit opens, tests recovery, and closes
+- **Rate Limit Tracking**: Logs 429 errors with cooldown/Retry-After information
+- **Timeout Detection**: Specifically marks timeout errors
 
 ## Advanced Usage
 
@@ -206,6 +276,36 @@ pkill cc-proxy
 
 ## Troubleshooting
 
+### Issue: Backend Keeps Getting Circuit Broken
+
+**Symptoms**: Logs show `[熔断触发]` and `[跳过] - 熔断中`
+
+**Possible Causes**:
+1. Backend is actually down or unstable
+2. Timeout too short for slow backend
+3. Network issues causing failures
+
+**Solutions**:
+1. Check backend health independently: `curl -I https://backend-url/v1/messages`
+2. Increase `retry.timeout_seconds` if backend is slow
+3. Increase `failover.circuit_breaker.failure_threshold` to be more tolerant
+4. Increase `failover.circuit_breaker.open_timeout_seconds` for faster recovery attempts
+5. Temporarily disable the backend in config if it's known to be down
+
+### Issue: Too Many 429 Rate Limit Errors
+
+**Symptoms**: Logs show `[限流记录]` frequently
+
+**Possible Causes**:
+1. Request rate exceeds backend limits
+2. Multiple clients sharing same token
+
+**Solutions**:
+1. Add more backends to distribute load
+2. Increase `failover.rate_limit.cooldown_seconds` to avoid hammering rate-limited backends
+3. Use separate tokens for different clients
+4. Reduce request frequency
+
 ### Issue: Intermittent 403/200 Responses
 
 **Symptoms**: Sometimes requests succeed (200), sometimes fail (403)
@@ -215,8 +315,8 @@ pkill cc-proxy
 2. **Token rate limiting**: A token exceeds rate limit and returns 403, recovers after waiting
 
 **Troubleshooting**:
-1. Check token preview in `[Attempt #N]` logs (e.g., `sk-a...xyz1`)
-2. Check specific error information in `[Error Details]`
+1. Check token preview in `[尝试 #N]` logs (e.g., `sk-a...xyz1`)
+2. Check specific error information in `[错误详情]`
 3. If different requests use different tokens, indicates switching between backends
 
 **Solutions**:
@@ -228,16 +328,20 @@ pkill cc-proxy
 
 **Troubleshooting Steps**:
 1. Check network connection: `curl -I https://api.anthropic.com`
-2. Verify token validity (check `[Error Details]` logs)
+2. Verify token validity (check `[错误详情]` logs)
 3. Confirm configuration file uses `token` field not `api_key`
 4. Confirm backend URL is correct
+5. Check if all backends are circuit-broken (check `[跳过]` logs)
 
 ### Issue: Request Timeout
 
+**Symptoms**: Logs show `[超时]` and timeout errors
+
 **Solutions**:
 1. Increase `retry.timeout_seconds` configuration
-2. Check network latency
-3. Check if backend responds slowly
+2. Check network latency to backend
+3. Check if backend is responding slowly
+4. Consider adding faster backends
 
 ## Performance
 
