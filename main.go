@@ -29,11 +29,15 @@ func main() {
 		if backend.Enabled {
 			status = "启用"
 		}
+		apiType := backend.APIType
+		if apiType == "" {
+			apiType = "claude"
+		}
 		modelInfo := ""
 		if backend.Model != "" {
 			modelInfo = fmt.Sprintf(" (模型覆盖: %s)", backend.Model)
 		}
-		log.Printf("  %d. %s - %s [%s]%s", i+1, backend.Name, backend.BaseURL, status, modelInfo)
+		log.Printf("  %d. %s - %s [%s] [API: %s]%s", i+1, backend.Name, backend.BaseURL, status, apiType, modelInfo)
 	}
 	log.Printf("最大重试次数: %d", server.config.Retry.MaxAttempts)
 	log.Printf("请求超时: %d 秒", server.config.Retry.Timeout)

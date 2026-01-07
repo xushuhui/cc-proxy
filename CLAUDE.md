@@ -4,7 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a lightweight Claude API failover proxy written in Go. It provides automatic failover between multiple Claude API backends with health checking and transparent request forwarding. When one backend fails, it automatically tries the next available backend without client intervention.
+This is a lightweight Claude API failover proxy written in Go. It provides automatic failover between multiple Claude API backends with circuit breaker, rate limit handling, and transparent request forwarding. When one backend fails, it automatically tries the next available backend without client intervention.
+
+**Key Features:**
+- Automatic failover on 5xx/429 errors
+- Circuit breaker to prevent repeated requests to failed backends
+- Rate limit handling with cooldown periods
+- Support for both Claude and OpenAI API backends with automatic format conversion
+- Compression support (gzip and zstd) with automatic detection
+- Streaming and non-streaming response handling
 
 ## Build and Run Commands
 
@@ -12,7 +20,7 @@ This is a lightweight Claude API failover proxy written in Go. It provides autom
 # Build the proxy
 go build -o cc-proxy
 
-# Run with default config
+# Run with default config (config.json)
 ./cc-proxy
 
 # Run with custom config
@@ -21,137 +29,191 @@ go build -o cc-proxy
 # Build and run in one step
 go run main.go -config config.json
 
-# Tidy dependencies
+# Add/update dependencies
 go mod tidy
+go get <package>
 ```
 
 ## Configuration
 
-The proxy is configured via `config.json` (JSON format). Key configuration sections:
+The proxy is configured via `config.json` (JSON format):
 
-- **port**: Proxy server listening port (default: 8080)
-- **backends**: Array of API backends with name, base_url, token, enabled flag, and optional model field. Backends are tried in order of priority.
-  - **model** (optional): If specified, the proxy will override the "model" field in the request body with this value before forwarding to the backend
-- **retry**: max_attempts and timeout_seconds for request handling
+**Required fields:**
+- `port`: Proxy server listening port
+- `backends`: Array of API backend configurations
 
-**Important**: The `token` field in config.json should contain the actual API token (not api_key). The proxy sets `Authorization: Bearer <token>` header when forwarding requests.
+**Backend configuration:**
+- `name`: Backend identifier (used in logs)
+- `base_url`: API base URL
+- `token`: Actual API token (proxy sets `Authorization: Bearer <token>`)
+- `enabled`: Whether to use this backend
+- `api_type` (optional): API type - "claude" (default) or "openai"
+- `model` (optional): Override the "model" field in requests
+
+**Optional configuration:**
+- `retry.timeout_seconds`: Request timeout for non-streaming requests
+- `failover.circuit_breaker`: Circuit breaker settings (failure_threshold, open_timeout_seconds, half_open_requests)
+- `failover.rate_limit`: Rate limit handling (cooldown_seconds)
 
 ## Architecture
 
-### Core Components
+### File Structure
 
-**ProxyServer** (main.go:41-44): Main server struct that handles:
-- Configuration management
-- HTTP client with timeout
-- Request forwarding and failover logic
+- **main.go**: Server initialization, startup, graceful shutdown
+- **config.go**: Configuration structs (Backend, Config)
+- **config_loader.go**: JSON config file loading
+- **proxy.go**: Core request handling, response forwarding, compression handling
+- **converter.go**: Claude ↔ OpenAI format conversion for requests/responses
+- **circuit_breaker.go**: Circuit breaker and rate limit state management
 
-**Request Flow**:
-1. Client request arrives at ServeHTTP (main.go:86)
-2. Request body is read and buffered
-3. Log request start with backend count
-4. Iterate through enabled backends in priority order
-5. Skip disabled backends (logged with reason)
-6. Forward request via forwardRequest (main.go:160) with backend's token
-7. If backend has model configured, override the "model" field in request body (logged as [模型覆盖])
-8. Log all non-2xx responses with decompressed body content
-9. On 5xx errors, 429 errors, or network failures, try next backend (failover)
-10. On 3xx/4xx errors (except 429), return to client immediately (no failover)
-11. On success, copy response back to client via copyResponse (main.go:254)
-12. If all backends fail, return 502 Bad Gateway
+### Request Flow
 
-### Key Implementation Details
+1. **ServeHTTP** (proxy.go): Entry point, reads request body
+2. **CircuitBreaker.SortBackendsByPriority**: Sorts backends (non-rate-limited first, then by config order)
+3. For each backend:
+   - **CircuitBreaker.ShouldSkipBackend**: Check if backend should be skipped (disabled, circuit open, rate limit cooldown)
+   - **forwardRequest**: Forward request to backend
+     - Detects streaming requests (`"stream": true` in request body)
+     - Converts request format if `api_type == "openai"`
+     - Adds timeout context for non-streaming requests only
+     - Replaces `Authorization` header with backend's token
+   - On error/429/5xx: **CircuitBreaker.RecordFailure/Record429**, try next backend
+   - On success: **CircuitBreaker.RecordSuccess**, return response to client
+4. If all backends fail: Return 502 Bad Gateway
 
-- **Request Buffering**: Request body is fully read into memory to enable retries across backends
-- **Header Forwarding**: All original request headers are preserved, except Authorization is replaced with backend token
-- **No API Version Header**: Does not set `anthropic-version` header, allowing backends to use their default version
-- **Graceful Shutdown**: Listens for SIGINT/SIGTERM and allows 10 seconds for in-flight requests to complete
-- **Error Handling**: 5xx and 429 status codes trigger failover; other 3xx/4xx errors are returned immediately
-- **Error Logging**: All non-2xx responses log the full response body (truncated to 500 chars) for debugging
-- **Gzip Support**: Automatically detects and decompresses gzip-encoded responses via readResponseBody helper (main.go:237-251)
-- **Token Preview**: Logs show first 4 and last 4 chars of token for debugging without exposing full token
-- **Attempt Tracking**: Each request logs attempt number and which backend is being tried
-- **Model Override**: If a backend has `model` configured, the proxy will parse the JSON request body and replace the "model" field before forwarding
+### Response Handling
 
-## Usage with Claude Code
+Two paths based on `api_type`:
 
-To use this proxy with Claude Code:
+**Claude backends** (`api_type == "claude"` or unset):
+- **copyResponse**: Direct passthrough with minimal overhead
+- **convertStreamingResponse**: For streaming, passthrough with detailed logging
 
-```bash
-# Start the proxy
-./cc-proxy -config config.json
+**OpenAI backends** (`api_type == "openai"`):
+- **copyAndConvertResponse**:
+  - Non-streaming: Read body, decompress (gzip/zstd), convert OpenAI → Claude format, send to client
+  - Streaming: **convertStreamingResponse** with chunk-by-chunk conversion
 
-# Configure Claude Code to use the proxy
-export ANTHROPIC_BASE_URL=http://localhost:3456
-export ANTHROPIC_API_KEY=dummy  # Proxy handles real tokens
+### Format Conversion (converter.go)
 
-# Run Claude Code
-claude
-```
+- **convertClaudeToOpenAI**: Transforms Claude request format to OpenAI format
+  - Converts `messages` array (Claude's content array → OpenAI's string/array)
+  - Maps Claude model names to OpenAI equivalents
+  - Moves `system` field to system message in `messages` array
 
-The proxy transparently handles all API requests and automatically fails over between configured backends.
+- **convertOpenAIToClaude**: Transforms OpenAI response format to Claude format
+  - Converts `choices` array → `content` array
+  - Maps `finish_reason` → `stop_reason`
+  - Converts `usage` fields
+  - Auto-detects if response is already Claude format and passes through
 
-## Backend Management
+- **convertOpenAIStreamToClaude**: Converts streaming SSE chunks
 
-Backends are configured in `config.json` and loaded at startup. To enable/disable backends or change configuration:
+### Circuit Breaker (circuit_breaker.go)
 
-1. Edit `config.json` to modify backend settings (enabled/disabled, tokens, model overrides, etc.)
-2. Restart the proxy for changes to take effect
+**States per backend:**
+- **Closed**: Normal operation, requests allowed
+- **Open**: After `failure_threshold` consecutive failures, blocks requests for `open_timeout_seconds`
+- **Half-Open**: After open timeout, allows `half_open_requests` test requests to see if backend recovered
 
-Example configuration:
-```json
-{
-  "port": 3456,
-  "backends": [
-    {
-      "name": "backend1",
-      "base_url": "https://api.example.com",
-      "token": "sk-ant-xxx",
-      "enabled": true,
-      "model": "claude-3-5-sonnet-20241022"
-    },
-    {
-      "name": "backend2",
-      "base_url": "https://api.another.com",
-      "token": "sk-ant-yyy",
-      "enabled": false
-    }
-  ],
-  "retry": {
-    "max_attempts": 3,
-    "timeout_seconds": 30
-  }
-}
-```
+**Rate limiting:**
+- Tracks 429 errors per backend
+- Enforces `cooldown_seconds` before retrying rate-limited backends
+- Supports `Retry-After` header from backend
 
-## Code Modification Guidelines
+### Compression Handling (proxy.go:readResponseBody)
 
-- When adding new configuration options, update both the Config struct and the validation logic in NewProxyServer
-- All response body reading must use `readResponseBody()` helper to handle gzip compression automatically
-- When backends return non-2xx responses, the response body is logged for debugging (see forwardRequest function)
-- The proxy preserves all request/response headers and body content for transparency
-- Logging uses Chinese characters - maintain this convention for consistency
-- All backend tokens are stored in config.json and injected during request forwarding
+**Automatic detection and decompression:**
+- gzip via `Content-Encoding: gzip` header
+- zstd via `Content-Encoding: zstd` header
+- Fallback detection via magic bytes (gzip: `1f 8b`, zstd: `28 b5 2f fd`)
 
-## Debugging Tips
+Applied to all response body reading paths.
 
-When investigating backend failures:
-1. Check `[请求开始]` logs to see how many backends are configured
-2. Check `[尝试 #N]` logs to see which backend is being tried and which token (preview)
-3. Check `[模型覆盖]` logs to see if the request model is being overridden by backend config
-4. Check `[跳过]` logs to see if backends are disabled
-5. Check `[错误详情]` logs for all non-2xx responses with decompressed error messages
-6. Check `[成功 #N]` or `[失败 #N]` to see final outcome
-7. Gzip-compressed responses are automatically decompressed for readable logs
-8. Token previews show first/last 4 chars (e.g., "sk-a...xyz1") to identify which token without exposing it
+### Timeout Handling
+
+**Critical distinction:**
+- **Non-streaming requests**: Use `context.WithTimeout` (configurable via `retry.timeout_seconds`)
+- **Streaming requests**: No timeout (would kill long-lived streams)
+
+Detected by parsing request body for `"stream": true` field.
+
+### Logging
+
+All logs use Chinese for consistency. Key log prefixes:
+- `[请求开始]`: Request received, backend count
+- `[跳过]`: Backend skipped (with reason)
+- `[尝试 #N]`: Which backend being tried
+- `[超时设置]`: Timeout configuration
+- `[格式转换]`: Request format conversion
+- `[模型覆盖]`: Model override applied
+- `[错误详情]`: Non-2xx response with body preview
+- `[成功 #N]` / `[失败 #N]`: Final outcome
+- `[流式开始/内容/完成]`: Streaming response details
+- `[readResponseBody]`: Compression detection and decompression
+
+## Important Implementation Details
+
+### Request Buffering
+Request body is fully read into memory to enable retries across backends. Trade-off: higher memory usage for reliable failover.
+
+### Streaming Response Handling
+For Claude API backends with streaming responses, the proxy:
+- Passes through SSE events and data chunks
+- Logs each content chunk with actual text content
+- Accumulates full response text for final log
+- Handles both standard Claude format and auto-detects OpenAI format
+
+### OpenAI Backend Support
+When `api_type: "openai"`:
+- Requests are converted from Claude → OpenAI format before sending
+- Responses are converted from OpenAI → Claude format before returning to client
+- Conversion is bidirectional for both streaming and non-streaming
+- Auto-detects if backend returns Claude format despite `api_type: "openai"` config
+
+### Token Management
+- `token` field in config contains actual API token
+- Logs show token preview (first 4 + "..." + last 4 chars) for debugging
+- Original `Authorization` header from client is replaced with backend's token
+
+### Model Override
+If backend has `model` configured:
+- Proxy parses JSON request body
+- Replaces `model` field with backend's configured value
+- Logged as `[模型覆盖]`
 
 ## Common Issues
 
-**Intermittent 403/200 responses**:
-- Check logs to see if different backends are being used (token preview will differ)
-- 403 does NOT trigger failover - only 5xx and 429 errors do
-- If one backend has invalid token (403), it will always return 403
-- Disable failing backends in config.json and restart the proxy
+**Streaming responses timeout:**
+- Symptom: `context deadline exceeded` during streaming
+- Cause: Global http.Client.Timeout was killing streams
+- Fix: Removed global timeout, only apply to non-streaming requests via context
 
-**Gzip decompression errors**:
-- All response reading uses `readResponseBody()` which handles gzip automatically
-- If you see "创建 gzip reader 失败", the response claims to be gzip but isn't valid
+**Compression not detected:**
+- Proxy auto-detects gzip/zstd via header or magic bytes
+- Check `[readResponseBody]` logs for `Content-Encoding` header value
+- If backend returns compressed data without header, magic byte detection should handle it
+
+**OpenAI backend returns Claude format:**
+- Auto-detection in `convertOpenAIToClaude` checks for `type: "message"` field
+- If detected, returns data as-is without conversion
+- Logged as `[格式检测] - 响应已经是 Claude 格式,直接透传`
+
+**Intermittent 403/200 responses:**
+- 403 errors do NOT trigger failover (only 5xx and 429 do)
+- Check token previews in logs to see if different backends are being used
+- Disable failing backends in config.json
+
+**Circuit breaker not opening:**
+- Requires `failure_threshold` consecutive failures
+- Check `[跳过]` logs to see if circuit is open
+- Failures must be from actual backend errors (5xx), not client errors (4xx except 429)
+
+## Code Modification Guidelines
+
+- **All response body reading** must use `readResponseBody()` helper (handles compression)
+- **New configuration options**: Update Config struct in config.go and validation in NewProxyServer
+- **Logging**: Maintain Chinese convention for consistency with existing logs
+- **Format conversion**: Add new conversion functions in converter.go if supporting new API types
+- **Circuit breaker logic**: Modify circuit_breaker.go if changing failover behavior
+- **Timeout handling**: Be aware of streaming vs non-streaming distinction

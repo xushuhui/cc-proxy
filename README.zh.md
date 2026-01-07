@@ -16,6 +16,7 @@
 - **零依赖**：编译后单个二进制文件,无需额外依赖
 - **安全日志**：Token 仅显示前后 4 个字符,避免泄露完整密钥
 - **模型覆盖**：可选的按后端模型覆盖,强制使用特定模型版本
+- **OpenAI API 适配**：支持将 Claude API 请求自动转换为 OpenAI API 格式,实现混合后端
 
 ## 快速开始
 
@@ -39,6 +40,7 @@ go build -o cc-proxy
       "base_url": "https://api.anthropic.com",  // API 基础 URL
       "token": "sk-ant-api03-your-key-1",       // API token(不是 api_key!)
       "enabled": true,                          // 是否启用此后端
+      "api_type": "claude",                     // (可选)API 类型: "claude" 或 "openai",默认 "claude"
       "model": "claude-3-5-sonnet-20241022"    // (可选)覆盖请求中的模型
     },
     {
@@ -46,6 +48,14 @@ go build -o cc-proxy
       "base_url": "https://api.backup.example.com",
       "token": "your-backup-key",
       "enabled": true
+    },
+    {
+      "name": "OpenAI Backend",
+      "base_url": "https://api.openai.com/v1",
+      "token": "sk-your-openai-key",
+      "api_type": "openai",                     // 设置为 openai 以启用自动格式转换
+      "model": "gpt-4o",
+      "enabled": false
     }
   ],
   "retry": {
@@ -189,22 +199,47 @@ claude
 ### 请求处理日志
 
 ```
-[请求开始] POST /v1/messages - 将尝试 3 个后端
-[尝试 #1] Anthropic Official - POST https://api.anthropic.com/v1/messages (token: sk-a...xyz1)
-[模型覆盖] Anthropic Official - 使用配置的 model: claude-3-5-sonnet-20241022
-[错误详情] Anthropic Official - HTTP 500 - 响应: {"error":{"type":"internal_error","message":"Service temporarily unavailable"}}
-[失败 #1] Anthropic Official - 后端返回错误: HTTP 500
-[尝试 #2] Backup Provider - POST https://api.backup.com/v1/messages (token: sk-b...abc2)
-[成功 #2] Backup Provider - HTTP 200
+[请求开始] POST /v1/messages - 配置了 3 个后端
+[跳过] Backend1 - 熔断中 (还需 25 秒)
+[尝试 #1] Backend2 - POST https://api.anthropic.com/v1/messages (token: sk-a...xyz1)
+[模型覆盖] Backend2 - 使用配置的模型: claude-3-5-sonnet-20241022
+[错误详情] Backend2 - HTTP 500 - 响应: {"error":{"type":"internal_error","message":"Service temporarily unavailable"}}
+[失败 #1] Backend2 - 后端返回错误: HTTP 500
+[熔断触发] Backend2 - 连续失败 3 次,熔断 30 秒 (HTTP 500)
+[尝试 #2] Backend3 - POST https://api.backup.com/v1/messages (token: sk-b...abc2)
+[成功 #2] Backend3 - HTTP 200
+```
+
+**熔断器日志**：
+```
+[熔断触发] Backend1 - 连续失败 3 次,熔断 30 秒 (HTTP 502)
+[跳过] Backend1 - 熔断中 (还需 25 秒)
+[尝试 #1] Backend1 - ... [熔断测试 1/1]
+[熔断恢复] Backend1 - 后端已恢复正常
+```
+
+**限流日志**：
+```
+[限流记录] Backend2 - 触发 429,Retry-After: 60 秒
+[限流记录] Backend3 - 触发 429,冷却 60 秒
+```
+
+**超时日志**：
+```
+[超时] Backend1 - 请求超时 (30 秒)
+[失败 #1] Backend1 - ... context deadline exceeded
 ```
 
 ### 日志特性
 
-- **Token 安全**：只显示 token 的前 4 和后 4 个字符（如 `sk-a...xyz1`），避免泄露完整密钥
-- **尝试编号**：显示 `#1`、`#2` 等，清楚看到尝试了哪些后端
-- **错误详情**：所有非 2xx 响应都会显示完整的错误信息（自动解压 gzip）
-- **跳过原因**：显示后端被跳过的原因（已禁用）
+- **Token 安全**：只显示 token 的前 4 和后 4 个字符(如 `sk-a...xyz1`),避免泄露完整密钥
+- **尝试编号**：显示 `#1`、`#2` 等,清楚看到尝试了哪些后端
+- **错误详情**：所有非 2xx 响应都会显示完整的错误信息(自动解压 gzip)
+- **跳过原因**：显示后端被跳过的原因(熔断中/半开测试中/禁用)
 - **模型覆盖**：显示请求模型被后端配置覆盖的情况
+- **熔断器事件**：记录熔断打开、测试恢复、关闭的过程
+- **限流追踪**：记录 429 错误及冷却/Retry-After 信息
+- **超时检测**：特别标记超时错误
 
 ## 高级用法
 
@@ -251,38 +286,72 @@ pkill cc-proxy
 
 ## 故障排查
 
-### 问题：间歇性 403/200 响应
+### 问题：后端持续熔断
 
-**症状**：有时候请求成功（200），有时候失败（403）
+**症状**：日志显示 `[熔断触发]` 和 `[跳过] - 熔断中`
 
 **可能原因**：
-1. **多个后端轮换使用**：第一个后端 token 无效返回 403，但 403 不触发故障转移，所以直接返回给客户端
-2. **Token 限流**：某个 token 超过限流后返回 403，等待一段时间后恢复
+1. 后端确实宕机或不稳定
+2. 超时时间对慢速后端来说太短
+3. 网络问题导致失败
+
+**解决方案**：
+1. 独立检查后端健康状态：`curl -I https://backend-url/v1/messages`
+2. 如果后端较慢,增加 `retry.timeout_seconds`
+3. 增加 `failover.circuit_breaker.failure_threshold` 以提高容忍度
+4. 增加 `failover.circuit_breaker.open_timeout_seconds` 以更快尝试恢复
+5. 如果已知后端宕机,在配置中临时禁用该后端
+
+### 问题：频繁出现 429 限流错误
+
+**症状**：日志频繁显示 `[限流记录]`
+
+**可能原因**：
+1. 请求速率超过后端限制
+2. 多个客户端共享同一个 token
+
+**解决方案**：
+1. 添加更多后端来分散负载
+2. 增加 `failover.rate_limit.cooldown_seconds` 避免对限流后端持续请求
+3. 为不同客户端使用独立的 token
+4. 降低请求频率
+
+### 问题：间歇性 403/200 响应
+
+**症状**：有时候请求成功(200),有时候失败(403)
+
+**可能原因**：
+1. **多个后端轮换使用**：第一个后端 token 无效返回 403,但 403 不触发故障转移,所以直接返回给客户端
+2. **Token 限流**：某个 token 超过限流后返回 403,等待一段时间后恢复
 
 **排查方法**：
-1. 查看日志中的 `[尝试 #N]` 行，检查 token 预览（如 `sk-a...xyz1`）
+1. 查看日志中的 `[尝试 #N]` 行,检查 token 预览(如 `sk-a...xyz1`)
 2. 查看 `[错误详情]` 中的具体错误信息
-3. 如果不同请求使用了不同的 token，说明在多个后端间切换
+3. 如果不同请求使用了不同的 token,说明在多个后端间切换
 
 **解决方案**：
 - 在 config.json 中禁用无效 token 的后端并重启代理
 - 检查并更新无效的 token
-- 如果是限流问题，考虑增加更多后端或降低请求频率
+- 如果是限流问题,考虑增加更多后端或降低请求频率
 
 ### 问题：所有后端都失败
 
 **排查步骤**：
 1. 检查网络连接：`curl -I https://api.anthropic.com`
-2. 验证 token 是否有效（查看 `[错误详情]` 日志）
+2. 验证 token 是否有效(查看 `[错误详情]` 日志)
 3. 确认配置文件中使用的是 `token` 字段而不是 `api_key`
 4. 确认后端 URL 是否正确
+5. 检查是否所有后端都被熔断(查看 `[跳过]` 日志)
 
 ### 问题：请求超时
 
+**症状**：日志显示 `[超时]` 和超时错误
+
 **解决方案**：
 1. 增加 `retry.timeout_seconds` 配置
-2. 检查网络延迟
+2. 检查到后端的网络延迟
 3. 查看后端是否响应缓慢
+4. 考虑添加响应更快的后端
 
 ## 性能优化
 
