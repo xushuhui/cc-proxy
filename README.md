@@ -1,21 +1,31 @@
 # CC Proxy
 
-A lightweight Claude API reverse proxy with automatic failover support for multiple API keys. When one backend fails, it automatically switches to the next available backend, completely transparent to clients.
+A lightweight Claude API reverse proxy with automatic failover support, intelligent circuit breaker, and rate limit handling. When one backend fails, it automatically switches to the next available backend, completely transparent to clients.
 
 [中文文档](README.zh.md)
 
 ## Features
 
+### Core Functionality
 - **Automatic Failover**: Automatically tries backup keys when primary API key fails (only 5xx/429 errors trigger failover)
 - **Circuit Breaker**: Smart circuit breaker prevents repeated requests to failing backends
 - **Rate Limit Handling**: Intelligent 429 error handling with cooldown and Retry-After header support
-- **Timeout Handling**: Request timeouts trigger automatic failover to next backend
-- **Detailed Error Logging**: All non-2xx responses are logged with detailed error information, supports automatic gzip decompression
-- **Transparent Proxy**: Fully forwards all HTTP requests and responses
+- **Timeout Handling**: Non-streaming requests timeout triggers failover, streaming requests have no timeout limit
+
+### API Support
+- **Claude API Backends**: Native support for Claude API format and compatible endpoints
+
+### Compression & Transmission
+- **Smart Compression Handling**: Automatically detects and decompresses gzip and zstd compressed responses
+- **Streaming Response Support**: Fully supports both streaming and non-streaming responses
+- **Transparent Proxy**: Fully forwards all HTTP requests and response headers
+
+### Development & Operations
 - **Flexible Configuration**: JSON configuration file, supports multiple backends, timeout, retry settings
-- **Zero Dependencies**: Single binary after compilation, no additional dependencies required
+- **Detailed Logging**: All requests and responses have detailed logs, including real-time streaming content display
 - **Secure Logging**: Tokens only show first and last 4 characters to avoid leaking complete keys
 - **Model Override**: Optional per-backend model override to force specific model versions
+- **Zero Dependencies**: Single binary after compilation, no additional dependencies required
 
 ## Quick Start
 
@@ -32,43 +42,43 @@ Edit `config.json` file to configure your API tokens and backend addresses:
 
 ```json
 {
-  "port": 3456,  // Proxy server listening port
+  "port": 3456,
   "backends": [
     {
-      "name": "Anthropic Official",      // Backend name (for logging)
-      "base_url": "https://api.anthropic.com",  // API base URL
-      "token": "sk-ant-api03-your-key-1",       // API token (not api_key!)
-      "enabled": true,                          // Whether this backend is enabled
-      "model": "claude-3-5-sonnet-20241022"    // (Optional) Override model in requests
+      "name": "Anthropic Official",
+      "base_url": "https://api.anthropic.com",
+      "token": "sk-ant-api03-your-key-1",
+      "enabled": true,
+      "model": "claude-3-5-sonnet-20241022"
     },
     {
-      "name": "Backup Provider",
+      "name": "Backup Claude Provider",
       "base_url": "https://api.backup.example.com",
       "token": "your-backup-key",
       "enabled": true
     }
   ],
   "retry": {
-    "max_attempts": 3,        // Maximum retry attempts (unused in current version)
-    "timeout_seconds": 30     // Request timeout in seconds
+    "max_attempts": 3,
+    "timeout_seconds": 30
   },
   "failover": {
     "circuit_breaker": {
-      "failure_threshold": 3,       // Number of consecutive failures to trigger circuit breaker
-      "open_timeout_seconds": 30,   // How long circuit stays open (seconds)
-      "half_open_requests": 1       // Number of test requests in half-open state
+      "failure_threshold": 3,
+      "open_timeout_seconds": 30,
+      "half_open_requests": 1
     },
     "rate_limit": {
-      "cooldown_seconds": 60        // Cooldown time after 429 rate limit error (seconds)
+      "cooldown_seconds": 60
     }
   }
 }
 ```
 
-**Important**:
-- The configuration field is `token`, not `api_key`
-- The `model` field is optional - if specified, the proxy will override the model in the request body
-- The `failover` section is optional - defaults will be used if not specified
+**Configuration Notes**:
+- `token`: API token (note: token not api_key)
+- `model`: Optional model override to force specific model
+- `failover`: Optional failover configuration with sensible defaults
 
 ### 3. Start Proxy
 
@@ -78,18 +88,18 @@ Edit `config.json` file to configure your API tokens and backend addresses:
 
 Example output:
 ```
-2024/12/26 12:00:00 Claude API 故障转移代理启动中...
-2024/12/26 12:00:00 监听端口: 3456
-2024/12/26 12:00:00 配置的后端:
-2024/12/26 12:00:00   1. Anthropic Official - https://api.anthropic.com [启用]
-2024/12/26 12:00:00   2. Backup Provider - https://api.backup.example.com [启用]
-2024/12/26 12:00:00 最大重试次数: 3
-2024/12/26 12:00:00 请求超时: 30 秒
-2024/12/26 12:00:00 熔断配置: 连续失败 3 次触发,熔断 30 秒
-2024/12/26 12:00:00 限流配置: 429 错误后冷却 60 秒
+2026/01/07 14:00:00 Claude API Failover Proxy Starting...
+2026/01/07 14:00:00 Listening on port: 3456
+2026/01/07 14:00:00 Configured backends:
+2026/01/07 14:00:00   1. Anthropic Official - https://api.anthropic.com [Enabled]
+2026/01/07 14:00:00   2. Backup Provider - https://api.backup.com [Enabled]
+2026/01/07 14:00:00 Max retry attempts: 3
+2026/01/07 14:00:00 Request timeout: 30 seconds
+2026/01/07 14:00:00 Circuit breaker: 3 failures trigger, 30 second open timeout
+2026/01/07 14:00:00 Rate limit: 60 second cooldown after 429 errors
 
-2024/12/26 12:00:00 ✓ 代理服务器运行在 http://localhost:3456
-2024/12/26 12:00:00 ✓ 配置 Claude Code: export ANTHROPIC_BASE_URL=http://localhost:3456
+2026/01/07 14:00:00 ✓ Proxy running at http://localhost:3456
+2026/01/07 14:00:00 ✓ Configure Claude Code: export ANTHROPIC_BASE_URL=http://localhost:3456
 ```
 
 ### 4. Configure Claude Code
@@ -103,48 +113,38 @@ export ANTHROPIC_API_KEY=dummy  # Proxy handles real tokens
 claude
 ```
 
-Or configure other Claude clients to use the proxy.
-
 ## Configuration
-
-### Basic Configuration
-
-| Config | Description | Default |
-|--------|-------------|---------|
-| `port` | Proxy server listening port | 3456 |
 
 ### Backend Configuration
 
 Each backend supports the following configuration:
 
-| Config | Description | Required |
-|--------|-------------|----------|
-| `name` | Backend name (for logging) | Yes |
-| `base_url` | API base URL | Yes |
-| `token` | API Token (note: token not api_key) | Yes |
-| `enabled` | Whether enabled | Yes |
-| `model` | Model override (optional) | No |
+| Config | Description | Required | Default |
+|--------|-------------|----------|---------|
+| `name` | Backend name (for logging) | Yes | - |
+| `base_url` | API base URL | Yes | - |
+| `token` | API Token | Yes | - |
+| `enabled` | Whether enabled | Yes | - |
+| `model` | Model override (optional) | No | - |
 
-Backends are tried in order of priority. **Note**: Only 5xx/429 errors and network errors trigger failover. Other 4xx errors (like 403) are returned directly to the client.
+Backends are tried in order of priority. Failed backends automatically trigger the next backend.
 
-When `model` is specified, the proxy will replace the "model" field in the request body with the configured value before forwarding to the backend. This is useful for forcing specific model versions.
-
-### Retry Configuration
+### Retry & Timeout Configuration
 
 | Config | Description | Default |
 |--------|-------------|---------|
 | `retry.max_attempts` | Maximum retry attempts (unused in current version) | 3 |
-| `retry.timeout_seconds` | Single request timeout (seconds) | 30 |
+| `retry.timeout_seconds` | Non-streaming request timeout (seconds) | 30 |
+
+**Important**: Timeout configuration only applies to non-streaming requests. Streaming requests (`stream: true`) have no timeout limit to avoid long-running generations being interrupted.
 
 ### Failover Configuration
-
-The `failover` section configures circuit breaker and rate limit handling. All fields are optional with sensible defaults.
 
 | Config | Description | Default |
 |--------|-------------|---------|
 | `failover.circuit_breaker.failure_threshold` | Consecutive failures to trigger circuit breaker | 3 |
-| `failover.circuit_breaker.open_timeout_seconds` | How long circuit stays open before testing recovery (seconds) | 30 |
-| `failover.circuit_breaker.half_open_requests` | Number of test requests allowed in half-open state | 1 |
+| `failover.circuit_breaker.open_timeout_seconds` | How long circuit stays open (seconds) | 30 |
+| `failover.circuit_breaker.half_open_requests` | Number of test requests in half-open state | 1 |
 | `failover.rate_limit.cooldown_seconds` | Cooldown time after 429 rate limit (seconds) | 60 |
 
 **Circuit Breaker States**:
@@ -154,82 +154,122 @@ The `failover` section configures circuit breaker and rate limit handling. All f
 
 ## How It Works
 
-1. **Request Reception**: Proxy receives Claude Code API requests
-2. **Backend Selection**: Selects backends based on priority (normal > rate-limited > circuit-broken)
-3. **Circuit Breaker Check**: Skips backends in circuit-open state
-4. **Model Override**: If backend has `model` configured, replaces the model field in request body
-5. **Request Forwarding**: Forwards request to selected backend, replaces Authorization header with backend's token
-6. **Error Handling**:
+### Request Processing Flow
+
+1. **Request Reception**: Proxy receives client's API request
+2. **Backend Priority Sorting**:
+   - Normal state backends have priority
+   - Rate-limited backends are secondary
+   - Circuit-open backends are last
+3. **Attempt Each Backend**:
+   - Check if backend should be skipped (disabled/circuit-open/rate-limited)
+   - Detect request type (streaming/non-streaming)
+   - Add appropriate timeout control (non-streaming only)
+   - Forward request to backend
+4. **Error Handling & Failover**:
    - **5xx errors**: Record failure, trigger circuit breaker if threshold reached, try next backend
-   - **429 rate limit**: Record rate limit timestamp, lower priority for cooldown period, try next backend
+   - **429 rate limit**: Record rate limit timestamp, enter cooldown, try next backend
    - **Timeout**: Record failure, try next backend
    - **401/403**: Return immediately without retry (authentication error)
    - **Other 4xx**: Return immediately without retry (client error)
-7. **Circuit Breaker Recovery**: After timeout, backend enters half-open state for testing
-8. **Response Return**: Returns backend response completely to client
-
-**Important**: Only 5xx/429 errors, timeouts, and network errors trigger failover. Other 3xx/4xx errors (like 403 authentication failure) are returned directly to the client without trying other backends.
+5. **Response Processing**:
+   - Automatically decompress gzip/zstd compressed responses
+   - Return to client
 
 ```
-Request → Priority Sort (normal > rate-limited > circuit-broken)
-       ↓
-   Backend1 (circuit open - skip)
-       ↓
-   Backend2 (500 error → record failure → try next)
-       ↓
-   Backend3 (429 → record rate limit → try next)
-       ↓
-   Backend4 (success) → Response
+Request → Backend Priority Sorting
+      ↓
+  Backend1 (circuit open - skip)
+      ↓
+  Backend2 (500 error → record failure → try next)
+      ↓
+  Backend3 (429 → record rate limit → try next)
+      ↓
+  Backend4 (success) → Return to client
 ```
+
+### Compression Handling
+
+Proxy automatically handles the following compression formats:
+
+1. **gzip Compression**
+   - Detected via `Content-Encoding: gzip` response header
+   - Automatically decompresses and logs
+
+2. **zstd Compression**
+   - Detected via `Content-Encoding: zstd` response header
+   - Uses efficient zstd decompressor
+
+3. **Magic Byte Detection**
+   - Even when response doesn't declare compression
+   - Automatically recognizes via magic bytes:
+     - gzip: `1f 8b`
+     - zstd: `28 b5 2f fd`
 
 ## Logging
-
-The proxy outputs detailed request logs to help you understand the request processing:
 
 ### Request Processing Logs
 
 ```
-[请求开始] POST /v1/messages - 配置了 3 个后端
-[跳过] Backend1 - 熔断中 (还需 25 秒)
+[请求开始] POST /v1/messages - Configured 3 backends
+[跳过] Backend1 - Circuit opened (25s remaining)
 [尝试 #1] Backend2 - POST https://api.anthropic.com/v1/messages (token: sk-a...xyz1)
-[模型覆盖] Backend2 - 使用配置的模型: claude-3-5-sonnet-20241022
-[错误详情] Backend2 - HTTP 500 - 响应: {"error":{"type":"internal_error","message":"Service temporarily unavailable"}}
-[失败 #1] Backend2 - 后端返回错误: HTTP 500
-[熔断触发] Backend2 - 连续失败 3 次,熔断 30 秒 (HTTP 500)
+[超时设置] Backend2 - Non-streaming request, 30s timeout
+[模型覆盖] Backend2 - Using configured model: claude-3-5-sonnet-20241022
+[错误详情] Backend2 - HTTP 500 - Response: {"error":{"type":"internal_error"}}
+[失败 #1] Backend2 - Backend error: HTTP 500
+[熔断触发] Backend2 - 3 consecutive failures, circuit opened for 30s
 [尝试 #2] Backend3 - POST https://api.backup.com/v1/messages (token: sk-b...abc2)
 [成功 #2] Backend3 - HTTP 200
+[复制响应] Written 1523 bytes to client
 ```
 
-**Circuit Breaker Logs**:
+### Streaming Response Logs
+
 ```
-[熔断触发] Backend1 - 连续失败 3 次,熔断 30 秒 (HTTP 502)
-[跳过] Backend1 - 熔断中 (还需 25 秒)
-[尝试 #1] Backend1 - ... [熔断测试 1/1]
-[熔断恢复] Backend1 - 后端已恢复正常
+[流式开始] Backend1 - Started receiving streaming response
+[流式事件] Backend1 - message_start
+[流式内容 #1] Backend1 - "Hello"
+[流式内容 #2] Backend1 - "! How"
+[流式内容 #3] Backend1 - " can I"
+[流式事件 #4] Backend1 - type: content_block_stop
+[流式结束] Backend1 - Received [DONE] marker
+[完整内容] Backend1 - Hello! How can I help you today?
+[流式完成] Backend1 - Processing complete (15 lines, 8 data blocks, 31 total chars)
 ```
 
-**Rate Limit Logs**:
+### Format Conversion Logs
+
 ```
-[限流记录] Backend2 - 触发 429,Retry-After: 60 秒
-[限流记录] Backend3 - 触发 429,冷却 60 秒
+[readResponseBody] Content-Encoding header: 'zstd'
+[readResponseBody] Detected zstd compression, attempting decompression
+[readResponseBody] zstd decompressor created successfully
+[readResponseBody] Read 532 bytes of data
 ```
 
-**Timeout Logs**:
+### Circuit Breaker and Rate Limit Logs
+
+**Circuit Breaker**:
 ```
-[超时] Backend1 - 请求超时 (30 秒)
-[失败 #1] Backend1 - ... context deadline exceeded
+[熔断触发] Backend1 - 3 consecutive failures, circuit opened for 30s (HTTP 502)
+[跳过] Backend1 - Circuit opened (25s remaining)
+[尝试 #1] Backend1 - ... [circuit test 1/1]
+[熔断恢复] Backend1 - Backend recovered
+```
+
+**Rate Limit**:
+```
+[限流记录] Backend2 - 429 triggered, Retry-After: 60s
+[限流记录] Backend3 - 429 triggered, 60s cooldown
 ```
 
 ### Log Features
 
-- **Token Security**: Only shows first 4 and last 4 characters of token (e.g., `sk-a...xyz1`) to avoid leaking complete keys
-- **Attempt Numbering**: Shows `#1`, `#2`, etc., clearly see which backends were tried
-- **Error Details**: All non-2xx responses show complete error information (automatically decompresses gzip)
-- **Skip Reason**: Shows reason why backend was skipped (熔断中/半开测试中/禁用)
-- **Model Override**: Shows when request model is overridden by backend configuration
-- **Circuit Breaker Events**: Logs when circuit opens, tests recovery, and closes
-- **Rate Limit Tracking**: Logs 429 errors with cooldown/Retry-After information
-- **Timeout Detection**: Specifically marks timeout errors
+- **Token Security**: Only shows first 4 and last 4 characters of token (e.g., `sk-a...xyz1`)
+- **Real-time Streaming Content**: Each content block from streaming responses displays in real-time
+- **Complete Content Accumulation**: Shows full response text after streaming completes
+- **Compression Detection**: Detailed logging of compression format and decompression process
+- **Error Details**: All non-2xx responses show complete error information
 
 ## Advanced Usage
 
@@ -244,9 +284,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=xsh
-WorkingDirectory=/Users/xsh/gp/claude-proxy
-ExecStart=/Users/xsh/gp/claude-proxy/cc-proxy -config /Users/xsh/gp/claude-proxy/config.json
+User=your-username
+WorkingDirectory=/path/to/claude-proxy
+ExecStart=/path/to/claude-proxy/cc-proxy -config /path/to/claude-proxy/config.json
 Restart=on-failure
 
 [Install]
@@ -259,6 +299,7 @@ Start service:
 sudo systemctl daemon-reload
 sudo systemctl enable cc-proxy
 sudo systemctl start cc-proxy
+sudo systemctl status cc-proxy
 ```
 
 ### Run in Background
@@ -274,7 +315,42 @@ tail -f proxy.log
 pkill cc-proxy
 ```
 
+### Test Proxy
+
+**Test non-streaming request**:
+```bash
+curl -X POST http://localhost:3456/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy" \
+  -d '{
+    "model": "claude-sonnet",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 1000
+  }'
+```
+
+**Test streaming request**:
+```bash
+curl -X POST http://localhost:3456/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy" \
+  -d '{
+    "model": "claude-sonnet",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 1000,
+    "stream": true
+  }'
+```
+
 ## Troubleshooting
+
+### Issue: Streaming Response Timeout Interruption
+
+**Symptoms**: Logs show `context deadline exceeded` or streaming stops midway
+
+**Cause**: Global timeout in older versions kills long-running streaming responses
+
+**Solution**: Fixed in newer version. Ensure using latest code - streaming requests are no longer subject to timeout limits.
 
 ### Issue: Backend Keeps Getting Circuit Broken
 
@@ -292,37 +368,31 @@ pkill cc-proxy
 4. Increase `failover.circuit_breaker.open_timeout_seconds` for faster recovery attempts
 5. Temporarily disable the backend in config if it's known to be down
 
+### Issue: Compressed Response Unreadable
+
+**Symptoms**: Logs show `[二进制数据,长度: XXX 字节]`, response content is gibberish
+
+**Possible Causes**:
+1. Backend returns compressed response without declaring `Content-Encoding` header
+2. Proxy doesn't correctly recognize compression format
+
+**Troubleshooting**:
+1. Check `Content-Encoding` header in `[readResponseBody]` logs
+2. Verify if there are logs mentioning `检测到 gzip/zstd 压缩`
+
+**Solution**:
+- New version supports magic byte auto-detection, no declaration needed
+- If issues persist, check logs to confirm compression format
+
 ### Issue: Too Many 429 Rate Limit Errors
 
 **Symptoms**: Logs show `[限流记录]` frequently
-
-**Possible Causes**:
-1. Request rate exceeds backend limits
-2. Multiple clients sharing same token
 
 **Solutions**:
 1. Add more backends to distribute load
 2. Increase `failover.rate_limit.cooldown_seconds` to avoid hammering rate-limited backends
 3. Use separate tokens for different clients
 4. Reduce request frequency
-
-### Issue: Intermittent 403/200 Responses
-
-**Symptoms**: Sometimes requests succeed (200), sometimes fail (403)
-
-**Possible Causes**:
-1. **Multiple backends rotating**: First backend token invalid returns 403, but 403 doesn't trigger failover, so returned directly to client
-2. **Token rate limiting**: A token exceeds rate limit and returns 403, recovers after waiting
-
-**Troubleshooting**:
-1. Check token preview in `[尝试 #N]` logs (e.g., `sk-a...xyz1`)
-2. Check specific error information in `[错误详情]`
-3. If different requests use different tokens, indicates switching between backends
-
-**Solutions**:
-- Disable backends with invalid tokens in config.json and restart the proxy
-- Check and update invalid tokens
-- If rate limiting issue, consider adding more backends or reducing request frequency
 
 ### Issue: All Backends Failed
 
@@ -333,34 +403,24 @@ pkill cc-proxy
 4. Confirm backend URL is correct
 5. Check if all backends are circuit-broken (check `[跳过]` logs)
 
-### Issue: Request Timeout
-
-**Symptoms**: Logs show `[超时]` and timeout errors
-
-**Solutions**:
-1. Increase `retry.timeout_seconds` configuration
-2. Check network latency to backend
-3. Check if backend is responding slowly
-4. Consider adding faster backends
-
 ## Performance
 
 - **Memory Usage**: About 10-20MB
 - **Concurrency Support**: Go native concurrency, supports large number of concurrent connections
 - **Latency**: Proxy forwarding latency < 5ms
+- **Compression Performance**: zstd decompression is 2-5x faster than gzip
 
 ## Tech Stack
 
 - **Language**: Go 1.21+
-- **Dependencies**:
-  - `encoding/json` - JSON configuration parsing (standard library)
-  - Go standard library (`net/http`, `compress/gzip`, etc.)
+- **Core Dependencies**:
+  - `github.com/klauspost/compress/zstd` - zstd compression support
+  - Go standard library (`net/http`, `compress/gzip`, `encoding/json`, etc.)
 - **Features**:
-  - Zero external dependencies
-  - Automatic gzip decompression
-  - Graceful shutdown support
-  - No API version header, compatible with various backends
-  - Per-backend model override support
+  - Automatic gzip/zstd decompression
+  - Graceful shutdown support (SIGINT/SIGTERM)
+  - Circuit breaker and rate limit state management
+  - Real-time streaming response processing
 
 ## License
 

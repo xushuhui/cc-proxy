@@ -10,11 +10,16 @@ This is a lightweight Claude API failover proxy written in Go. It provides autom
 - Automatic failover on 5xx/429 errors
 - Circuit breaker to prevent repeated requests to failed backends
 - Rate limit handling with cooldown periods
-- Support for both Claude and OpenAI API backends with automatic format conversion
+- Support for Claude API backends
+- **OpenAI API backend support** with automatic format conversion (Claude ↔ OpenAI)
+- **Mixed backend support**: Use both Claude and OpenAI backends in the same failover chain
 - Compression support (gzip and zstd) with automatic detection
 - Streaming and non-streaming response handling
 
 ## Build and Run Commands
+
+**Requirements:**
+- Go 1.23 or higher
 
 ```bash
 # Build the proxy
@@ -32,11 +37,17 @@ go run main.go -config config.json
 # Add/update dependencies
 go mod tidy
 go get <package>
+
+# Format code (all code in single package)
+go fmt
+
+# Verify dependencies
+go mod verify
 ```
 
 ## Configuration
 
-The proxy is configured via `config.json` (JSON format):
+The proxy is configured via `config.json` (JSON format). See `config.example.json` for a template.
 
 **Required fields:**
 - `port`: Proxy server listening port
@@ -44,27 +55,82 @@ The proxy is configured via `config.json` (JSON format):
 
 **Backend configuration:**
 - `name`: Backend identifier (used in logs)
-- `base_url`: API base URL
+- `base_url`: API base URL (can include path, e.g., `https://api.example.com/v1` or `https://api.longcat.chat/anthropic`)
 - `token`: Actual API token (proxy sets `Authorization: Bearer <token>`)
 - `enabled`: Whether to use this backend
-- `api_type` (optional): API type - "claude" (default) or "openai"
+- `api_type`: API type, either `"claude"` (default) or `"openai"`
 - `model` (optional): Override the "model" field in requests
+
+**Important**: `base_url` can include path components. The proxy will append the client request path to the base URL path. For example:
+- `base_url: "https://api.example.com"` + request `/v1/messages` = `https://api.example.com/v1/messages`
+- `base_url: "https://api.longcat.chat/anthropic"` + request `/v1/messages` = `https://api.longcat.chat/anthropic/v1/messages`
 
 **Optional configuration:**
 - `retry.timeout_seconds`: Request timeout for non-streaming requests
 - `failover.circuit_breaker`: Circuit breaker settings (failure_threshold, open_timeout_seconds, half_open_requests)
 - `failover.rate_limit`: Rate limit handling (cooldown_seconds)
 
+## API Format Conversion
+
+The proxy supports both Claude and OpenAI API backends with automatic format conversion.
+
+### API Types
+
+- **`"claude"` (default)**: Backend uses Claude API format, direct passthrough
+  - Suitable for: Anthropic official API, Claude API compatible third-party services
+  - Request path: `/v1/messages` → `/v1/messages` (passthrough)
+  - Request format: Claude format (no conversion)
+  - Response format: Claude format (no conversion)
+
+- **`"openai"`**: Proxy automatically converts request/response format and path
+  - Suitable for: OpenAI official API, OpenAI compatible third-party services
+  - Request path: `/v1/messages` → `/v1/chat/completions` (auto conversion)
+  - Request format: Claude format → OpenAI format (auto conversion)
+  - Response format: OpenAI format → Claude format (auto conversion)
+  - Supports streaming and non-streaming responses
+  - Auto-detection: If response is already in Claude format, passthrough directly
+
+### Format Conversion Details
+
+**Request Conversion (Claude → OpenAI):**
+- Convert `messages` array format
+- Map model names (e.g., `claude-3-5-sonnet` → `gpt-4o`)
+- Convert `system` field to system message
+
+**Response Conversion (OpenAI → Claude):**
+- Convert `choices` → `content` array
+- Map `finish_reason` → `stop_reason`
+- Convert `usage` field format
+
+**Supported Model Mapping:**
+- `claude-sonnet-4-5` / `claude-sonnet-4-5-thinking` → `gpt-4o`
+- `claude-3-opus` → `gpt-4-turbo`
+- `claude-3-sonnet` → `gpt-4`
+- `claude-3-haiku` → `gpt-3.5-turbo`
+
+**Important Notes:**
+- Only true OpenAI API or OpenAI compatible endpoints should set `api_type: "openai"`
+- If backend supports Claude API format (even if it's based on OpenAI models), use `api_type: "claude"` or omit this field
+- Incorrect `api_type` configuration will cause 422 errors (format mismatch)
+
 ## Architecture
 
 ### File Structure
 
+**All code is in a single package (`main`):**
 - **main.go**: Server initialization, startup, graceful shutdown
 - **config.go**: Configuration structs (Backend, Config)
 - **config_loader.go**: JSON config file loading
 - **proxy.go**: Core request handling, response forwarding, compression handling
-- **converter.go**: Claude ↔ OpenAI format conversion for requests/responses
 - **circuit_breaker.go**: Circuit breaker and rate limit state management
+
+**Key dependencies:**
+- `github.com/klauspost/compress/zstd`: zstd compression support
+- Go standard library for everything else (no external HTTP frameworks)
+
+**Note:** This project currently has no test suite. When adding new features, consider writing tests to verify behavior, especially for:
+- Circuit breaker state transitions (circuit_breaker.go)
+- Request/response handling edge cases
 
 ### Request Flow
 
@@ -74,40 +140,19 @@ The proxy is configured via `config.json` (JSON format):
    - **CircuitBreaker.ShouldSkipBackend**: Check if backend should be skipped (disabled, circuit open, rate limit cooldown)
    - **forwardRequest**: Forward request to backend
      - Detects streaming requests (`"stream": true` in request body)
-     - Converts request format if `api_type == "openai"`
+     - **Format conversion**: If `api_type: "openai"`, converts Claude format → OpenAI format
+     - **Path conversion**: For OpenAI backends, converts `/v1/messages` → `/v1/chat/completions`
      - Adds timeout context for non-streaming requests only
      - Replaces `Authorization` header with backend's token
    - On error/429/5xx: **CircuitBreaker.RecordFailure/Record429**, try next backend
    - On success: **CircuitBreaker.RecordSuccess**, return response to client
+     - **Response conversion**: If OpenAI backend, converts OpenAI format → Claude format
 4. If all backends fail: Return 502 Bad Gateway
 
 ### Response Handling
 
-Two paths based on `api_type`:
-
-**Claude backends** (`api_type == "claude"` or unset):
-- **copyResponse**: Direct passthrough with minimal overhead
-- **convertStreamingResponse**: For streaming, passthrough with detailed logging
-
-**OpenAI backends** (`api_type == "openai"`):
-- **copyAndConvertResponse**:
-  - Non-streaming: Read body, decompress (gzip/zstd), convert OpenAI → Claude format, send to client
-  - Streaming: **convertStreamingResponse** with chunk-by-chunk conversion
-
-### Format Conversion (converter.go)
-
-- **convertClaudeToOpenAI**: Transforms Claude request format to OpenAI format
-  - Converts `messages` array (Claude's content array → OpenAI's string/array)
-  - Maps Claude model names to OpenAI equivalents
-  - Moves `system` field to system message in `messages` array
-
-- **convertOpenAIToClaude**: Transforms OpenAI response format to Claude format
-  - Converts `choices` array → `content` array
-  - Maps `finish_reason` → `stop_reason`
-  - Converts `usage` fields
-  - Auto-detects if response is already Claude format and passes through
-
-- **convertOpenAIStreamToClaude**: Converts streaming SSE chunks
+The proxy uses direct response passthrough for all backends:
+- **copyResponse**: Direct passthrough with minimal overhead for all responses
 
 ### Circuit Breaker (circuit_breaker.go)
 
@@ -148,9 +193,13 @@ All logs use Chinese for consistency. Key log prefixes:
 - `[格式转换]`: Request format conversion
 - `[模型覆盖]`: Model override applied
 - `[错误详情]`: Non-2xx response with body preview
-- `[成功 #N]` / `[失败 #N]`: Final outcome
+- `[成功 #N]`: Backend returned 2xx success
+- `[返回客户端]`: Backend returned 4xx client error (not retried)
+- `[失败 #N]`: Backend failed with error or 5xx/429 (will retry next backend)
 - `[流式开始/内容/完成]`: Streaming response details
 - `[readResponseBody]`: Compression detection and decompression
+- `[格式检测]`: Response format detection (Claude vs OpenAI)
+- `[OpenAI 原始响应]`: Raw OpenAI response before conversion
 
 ## Important Implementation Details
 
@@ -159,17 +208,8 @@ Request body is fully read into memory to enable retries across backends. Trade-
 
 ### Streaming Response Handling
 For Claude API backends with streaming responses, the proxy:
-- Passes through SSE events and data chunks
-- Logs each content chunk with actual text content
-- Accumulates full response text for final log
-- Handles both standard Claude format and auto-detects OpenAI format
-
-### OpenAI Backend Support
-When `api_type: "openai"`:
-- Requests are converted from Claude → OpenAI format before sending
-- Responses are converted from OpenAI → Claude format before returning to client
-- Conversion is bidirectional for both streaming and non-streaming
-- Auto-detects if backend returns Claude format despite `api_type: "openai"` config
+- Passes through responses directly without modification
+- All response data (headers, status, body) are forwarded as-is
 
 ### Token Management
 - `token` field in config contains actual API token
@@ -189,31 +229,39 @@ If backend has `model` configured:
 - Cause: Global http.Client.Timeout was killing streams
 - Fix: Removed global timeout, only apply to non-streaming requests via context
 
-**Compression not detected:**
-- Proxy auto-detects gzip/zstd via header or magic bytes
-- Check `[readResponseBody]` logs for `Content-Encoding` header value
-- If backend returns compressed data without header, magic byte detection should handle it
-
-**OpenAI backend returns Claude format:**
-- Auto-detection in `convertOpenAIToClaude` checks for `type: "message"` field
-- If detected, returns data as-is without conversion
-- Logged as `[格式检测] - 响应已经是 Claude 格式,直接透传`
-
-**Intermittent 403/200 responses:**
-- 403 errors do NOT trigger failover (only 5xx and 429 do)
-- Check token previews in logs to see if different backends are being used
-- Disable failing backends in config.json
-
 **Circuit breaker not opening:**
 - Requires `failure_threshold` consecutive failures
 - Check `[跳过]` logs to see if circuit is open
 - Failures must be from actual backend errors (5xx), not client errors (4xx except 429)
+
+**OpenAI backend format conversion errors:**
+- Symptom: 422 errors or malformed responses from OpenAI backends
+- Cause: Incorrect `api_type` configuration
+- Solution: Only set `api_type: "openai"` for true OpenAI API endpoints. If the backend returns Claude format, use `api_type: "claude"` (default)
+- Check `[格式检测]` logs to see if response format is correctly detected
 
 ## Code Modification Guidelines
 
 - **All response body reading** must use `readResponseBody()` helper (handles compression)
 - **New configuration options**: Update Config struct in config.go and validation in NewProxyServer
 - **Logging**: Maintain Chinese convention for consistency with existing logs
-- **Format conversion**: Add new conversion functions in converter.go if supporting new API types
 - **Circuit breaker logic**: Modify circuit_breaker.go if changing failover behavior
 - **Timeout handling**: Be aware of streaming vs non-streaming distinction
+- **URL path handling**: When modifying URL construction, use `targetURL.Path = targetURL.Path + originalReq.URL.Path` to preserve base_url paths (e.g., `/anthropic` in `https://api.longcat.chat/anthropic`)
+
+## Development Workflow
+
+When making changes to the proxy:
+
+1. **Edit code**: All source files are in the root directory
+2. **Test locally**: Use `go run main.go -config config.json` for quick testing
+3. **Build**: Use `go build -o cc-proxy` to create the binary
+4. **Format**: Run `go fmt` to format code (all files in single package)
+5. **Verify**: Run `go mod verify` to ensure dependency integrity
+
+**Debugging tips:**
+- Set `enabled: false` for failing backends to isolate issues
+- Use the detailed Chinese logs to trace request flow through backends
+- Check token previews in logs to verify correct backend is being used
+- Monitor circuit breaker state transitions in logs
+- The Authorization header in error logs is partially masked for security (shows first 15 and last 5 chars)

@@ -7,7 +7,6 @@ type Backend struct {
 	Enabled bool   `json:"enabled"`
 	Token   string `json:"token"`
 	Model   string `json:"model,omitempty"` // Optional: override model field in request
-	APIType string `json:"api_type,omitempty"` // API type: "claude" (default) or "openai"
 }
 
 // Config represents configuration file structure
