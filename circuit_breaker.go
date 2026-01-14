@@ -13,6 +13,7 @@ type BackendState struct {
 	backend          Backend
 	consecutiveFails int
 	lastFailTime     time.Time
+	lastError        string
 	circuitOpen      bool
 	last429Time      time.Time
 	retryAfter       time.Time
@@ -101,6 +102,7 @@ func (cb *CircuitBreaker) RecordFailure(state *BackendState, statusCode int) {
 
 	state.consecutiveFails++
 	state.lastFailTime = time.Now()
+	state.lastError = fmt.Sprintf("HTTP %d", statusCode)
 
 	if state.circuitOpen {
 		// Already open, reset half-open counter
@@ -186,4 +188,108 @@ func (cb *CircuitBreaker) SortBackendsByPriority() []*BackendState {
 	// Normal backends first, then rate-limited ones
 	result := append(normal, rateLimited...)
 	return result
+}
+
+// CircuitBreakerStateInfo represents circuit breaker state information
+type CircuitBreakerStateInfo struct {
+	State               string
+	ConsecutiveFailures int
+	LastFailureTime     time.Time
+	LastError           string
+}
+
+// RateLimitStateInfo represents rate limit state information
+type RateLimitStateInfo struct {
+	CooldownUntil *time.Time
+	RetryAfter    int
+}
+
+// GetBackendState returns the circuit breaker state for a backend by name
+func (cb *CircuitBreaker) GetBackendState(name string) CircuitBreakerStateInfo {
+	cb.stateMu.RLock()
+	defer cb.stateMu.RUnlock()
+
+	for _, state := range cb.states {
+		if state.backend.Name == name {
+			stateStr := "closed"
+			if state.circuitOpen {
+				timeout := time.Duration(cb.config.Failover.CircuitBreaker.OpenTimeoutSeconds) * time.Second
+				if time.Since(state.lastFailTime) >= timeout {
+					stateStr = "half-open"
+				} else {
+					stateStr = "open"
+				}
+			}
+
+			return CircuitBreakerStateInfo{
+				State:               stateStr,
+				ConsecutiveFailures: state.consecutiveFails,
+				LastFailureTime:     state.lastFailTime,
+				LastError:           state.lastError,
+			}
+		}
+	}
+
+	return CircuitBreakerStateInfo{State: "unknown"}
+}
+
+// GetRateLimitState returns the rate limit state for a backend by name
+func (cb *CircuitBreaker) GetRateLimitState(name string) RateLimitStateInfo {
+	cb.stateMu.RLock()
+	defer cb.stateMu.RUnlock()
+
+	for _, state := range cb.states {
+		if state.backend.Name == name {
+			var cooldownUntil *time.Time
+			retryAfter := 0
+
+			if !state.last429Time.IsZero() {
+				cooldown := time.Duration(cb.config.Failover.RateLimit.CooldownSeconds) * time.Second
+				until := state.last429Time.Add(cooldown)
+				if time.Now().Before(until) {
+					cooldownUntil = &until
+					retryAfter = int(time.Until(until).Seconds())
+				}
+			}
+
+			return RateLimitStateInfo{
+				CooldownUntil: cooldownUntil,
+				RetryAfter:    retryAfter,
+			}
+		}
+	}
+
+	return RateLimitStateInfo{}
+}
+
+// OnBackendEnabled is called when a backend is enabled via management API
+func (cb *CircuitBreaker) OnBackendEnabled(name string) {
+	cb.stateMu.Lock()
+	defer cb.stateMu.Unlock()
+
+	for _, state := range cb.states {
+		if state.backend.Name == name {
+			state.backend.Enabled = true
+			// Reset circuit breaker state when enabling
+			state.consecutiveFails = 0
+			state.circuitOpen = false
+			state.halfOpenTries = 0
+			log.Printf("[后端启用] %s - 已启用并重置熔断状态", name)
+			return
+		}
+	}
+}
+
+// OnBackendDisabled is called when a backend is disabled via management API
+func (cb *CircuitBreaker) OnBackendDisabled(name string) {
+	cb.stateMu.Lock()
+	defer cb.stateMu.Unlock()
+
+	for _, state := range cb.states {
+		if state.backend.Name == name {
+			state.backend.Enabled = false
+			log.Printf("[后端禁用] %s - 已禁用", name)
+			return
+		}
+	}
 }

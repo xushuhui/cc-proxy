@@ -18,9 +18,10 @@ import (
 
 // ProxyServer is the proxy server
 type ProxyServer struct {
-	config         *Config
-	client         *http.Client
-	circuitBreaker *CircuitBreaker
+	config          *Config
+	client          *http.Client
+	circuitBreaker  *CircuitBreaker
+	configManager   *ConfigManager
 }
 
 // NewProxyServer creates proxy server instance
@@ -30,14 +31,21 @@ func NewProxyServer(configPath string) (*ProxyServer, error) {
 		return nil, err
 	}
 
+	// Create config manager for dynamic backend management
+	configManager, err := NewConfigManager(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create config manager: %w", err)
+	}
+
 	server := &ProxyServer{
-		config: config,
+		config:         config,
 		client: &http.Client{
 			// Don't set Timeout here - it would kill streaming responses
 			// We'll use context with timeout for non-streaming requests only
 			Timeout: 0,
 		},
 		circuitBreaker: NewCircuitBreaker(config),
+		configManager:  configManager,
 	}
 
 	return server, nil
@@ -111,7 +119,7 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Printf("[成功 #%d] %s - %s - HTTP %d", attemptCount, state.backend.Name, targetURL, resp.StatusCode)
 		} else {
-			log.Printf("[返回客户端] %s - %s - HTTP %d (客户端错误,不重试)", attemptCount, state.backend.Name, targetURL, resp.StatusCode)
+			log.Printf("[返回客户端] %d - %s - HTTP %s - %s (客户端错误,不重试)", attemptCount, state.backend.Name, targetURL, resp.Status)
 		}
 
 		ps.copyResponse(w, resp)

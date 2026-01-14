@@ -21,6 +21,9 @@ func main() {
 		log.Fatalf("初始化失败: %v", err)
 	}
 
+	// Create Ares management server
+	managementServer := NewAresManagementServer(server.configManager, server.circuitBreaker, server)
+
 	log.Printf("Claude API 故障转移代理启动中...")
 	log.Printf("监听端口: %d", server.config.Port)
 	log.Printf("配置的后端:")
@@ -45,15 +48,18 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", server.config.Port)
 	log.Printf("\n✓ 代理服务器运行在 http://localhost%s", addr)
+	log.Printf("✓ 管理接口: http://localhost%s/api/backends", addr)
+	log.Printf("✓ 健康检查: http://localhost%s/health", addr)
 	log.Printf("✓ 配置 Claude Code: export ANTHROPIC_BASE_URL=http://localhost%s\n", addr)
 
-	srv := &http.Server{
+	// Create HTTP server with graceful shutdown
+	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: server,
+		Handler: managementServer.GetHandler(),
 	}
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("服务器启动失败: %v", err)
 		}
 	}()
@@ -67,7 +73,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Printf("服务器强制关闭: %v", err)
 	}
 
