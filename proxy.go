@@ -18,10 +18,9 @@ import (
 
 // ProxyServer is the proxy server
 type ProxyServer struct {
-	config          *Config
-	client          *http.Client
-	circuitBreaker  *CircuitBreaker
-	configManager   *ConfigManager
+	config         *Config
+	client         *http.Client
+	circuitBreaker *CircuitBreaker
 }
 
 // NewProxyServer creates proxy server instance
@@ -29,12 +28,6 @@ func NewProxyServer(configPath string) (*ProxyServer, error) {
 	config, err := loadConfig(configPath)
 	if err != nil {
 		return nil, err
-	}
-
-	// Create config manager for dynamic backend management
-	configManager, err := NewConfigManager(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create config manager: %w", err)
 	}
 
 	server := &ProxyServer{
@@ -45,7 +38,6 @@ func NewProxyServer(configPath string) (*ProxyServer, error) {
 			Timeout: 0,
 		},
 		circuitBreaker: NewCircuitBreaker(config),
-		configManager:  configManager,
 	}
 
 	return server, nil
@@ -185,8 +177,6 @@ func (ps *ProxyServer) forwardRequest(state *BackendState, originalReq *http.Req
 		defer cancel()
 		req = req.WithContext(ctx)
 		log.Printf("[超时设置] %s - 非流式请求,设置 %d 秒超时", backend.Name, ps.config.Retry.Timeout)
-	} else {
-		log.Printf("[超时设置] %s - 流式请求,不设置超时限制", backend.Name)
 	}
 
 	for key, values := range originalReq.Header {

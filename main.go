@@ -21,9 +21,6 @@ func main() {
 		log.Fatalf("初始化失败: %v", err)
 	}
 
-	// Create Ares management server
-	managementServer := NewAresManagementServer(server.configManager, server.circuitBreaker, server)
-
 	log.Printf("Claude API 故障转移代理启动中...")
 	log.Printf("监听端口: %d", server.config.Port)
 	log.Printf("配置的后端:")
@@ -48,14 +45,12 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", server.config.Port)
 	log.Printf("\n✓ 代理服务器运行在 http://localhost%s", addr)
-	log.Printf("✓ 管理接口: http://localhost%s/api/backends", addr)
-	log.Printf("✓ 健康检查: http://localhost%s/health", addr)
 	log.Printf("✓ 配置 Claude Code: export ANTHROPIC_BASE_URL=http://localhost%s\n", addr)
 
 	// Create HTTP server with graceful shutdown
 	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: managementServer.GetHandler(),
+		Handler: server,
 	}
 
 	go func() {
