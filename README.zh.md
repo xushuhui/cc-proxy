@@ -1,6 +1,6 @@
 # CC Proxy
 
-一个轻量级的 Claude API 反向代理，支持多个 API key 的自动故障转移、混合后端（Claude + OpenAI）、智能熔断和限流处理。当一个后端失败时，自动切换到下一个可用后端，对客户端完全透明。
+一个轻量级的 Claude API 反向代理，支持多个 API key 的自动故障转移、智能熔断和限流处理。当一个后端失败时，自动切换到下一个可用后端，对客户端完全透明。
 
 [English Documentation](README.md)
 
@@ -14,9 +14,6 @@
 
 ### API 支持
 - **Claude API 后端**：原生支持 Claude API 格式
-- **OpenAI API 后端**：自动将 Claude API 请求转换为 OpenAI 格式
-- **混合后端**：可同时配置 Claude 和 OpenAI 后端,实现真正的多云故障转移
-- **格式自动检测**：智能识别响应格式,无需担心配置错误
 
 ### 压缩与传输
 - **智能压缩处理**：自动检测并解压 gzip 和 zstd 压缩响应
@@ -59,14 +56,6 @@ go build -o cc-proxy
       "base_url": "https://api.backup.example.com",
       "token": "your-backup-key",
       "enabled": true
-    },
-    {
-      "name": "OpenAI Backend",
-      "base_url": "https://api.openai.com/v1",
-      "token": "sk-your-openai-key",
-      "api_type": "openai",
-      "model": "gpt-4o",
-      "enabled": false
     }
   ],
   "retry": {
@@ -88,7 +77,6 @@ go build -o cc-proxy
 
 **配置说明**：
 - `token`：API token（注意是 token 不是 api_key）
-- `api_type`：API 类型，可选值 `"claude"`（默认）或 `"openai"`
 - `model`：可选的模型覆盖，强制使用特定模型
 - `failover`：可选的故障转移配置，有合理的默认值
 
@@ -103,9 +91,8 @@ go build -o cc-proxy
 2026/01/07 14:00:00 Claude API 故障转移代理启动中...
 2026/01/07 14:00:00 监听端口: 3456
 2026/01/07 14:00:00 配置的后端:
-2026/01/07 14:00:00   1. Anthropic Official - https://api.anthropic.com [启用] [API: claude]
-2026/01/07 14:00:00   2. Backup Provider - https://api.backup.com [启用] [API: claude]
-2026/01/07 14:00:00   3. OpenAI Backend - https://api.openai.com/v1 [禁用] [API: openai]
+2026/01/07 14:00:00   1. Anthropic Official - https://api.anthropic.com [启用]
+2026/01/07 14:00:00   2. Backup Provider - https://api.backup.com [启用]
 2026/01/07 14:00:00 最大重试次数: 3
 2026/01/07 14:00:00 请求超时: 30 秒
 2026/01/07 14:00:00 熔断配置: 连续失败 3 次触发,熔断 30 秒
@@ -138,30 +125,9 @@ claude
 | `base_url` | API 基础 URL | 是 | - |
 | `token` | API Token | 是 | - |
 | `enabled` | 是否启用 | 是 | - |
-| `api_type` | API 类型：`"claude"` 或 `"openai"` | 否 | `"claude"` |
 | `model` | 模型覆盖（可选） | 否 | - |
 
 后端按配置顺序优先使用，失败后自动尝试下一个。
-
-**API 类型说明**：
-- `"claude"`（默认）：后端使用 Claude API 格式，直接透传
-  - 适用于：Anthropic 官方 API、Claude API 兼容的第三方服务
-  - 请求路径：`/v1/messages` → `/v1/messages`（透传）
-  - 请求格式：Claude 格式（不转换）
-  - 响应格式：Claude 格式（不转换）
-
-- `"openai"`：代理会自动转换请求/响应格式和路径
-  - 适用于：OpenAI 官方 API、OpenAI 兼容的第三方服务
-  - 请求路径：`/v1/messages` → `/v1/chat/completions`（自动转换）
-  - 请求格式：Claude 格式 → OpenAI 格式（自动转换）
-  - 响应格式：OpenAI 格式 → Claude 格式（自动转换）
-  - 支持流式和非流式响应
-  - 自动检测：如果响应已是 Claude 格式，直接透传
-
-**重要提示**：
-- 只有真正的 OpenAI API 或 OpenAI 兼容接口才应该设置 `api_type: "openai"`
-- 如果 backend 本身支持 Claude API 格式（即使它基于 OpenAI 模型），应该使用 `api_type: "claude"` 或不设置该字段
-- 错误的 `api_type` 配置会导致 422 错误（格式不匹配）
 
 ### 重试与超时配置
 
@@ -198,10 +164,6 @@ claude
 3. **逐个尝试后端**：
    - 检查后端是否应该跳过（禁用/熔断/限流）
    - 检测请求类型（流式/非流式）
-   - **根据 `api_type` 处理请求路径**：
-     - Claude 后端：`/v1/messages` → `base_url/v1/messages`
-     - OpenAI 后端：`/v1/messages` → `base_url/v1/chat/completions`
-   - 如果是 OpenAI 后端，转换请求格式
    - 添加适当的超时控制（仅非流式）
    - 转发请求到后端
 4. **错误处理与故障转移**：
@@ -211,49 +173,20 @@ claude
    - **401/403**：立即返回不重试(认证错误)
    - **其他 4xx**：立即返回不重试(客户端错误)
 5. **响应处理**：
-   - 如果是 OpenAI 后端，转换响应格式
    - 自动解压 gzip/zstd 压缩的响应
    - 返回给客户端
 
 ```
 请求 → 后端优先级排序
      ↓
- 后端1 (熔断打开 - 跳过)
+  后端1 (熔断打开 - 跳过)
      ↓
- 后端2 (OpenAI 格式转换 → 500 错误 → 记录失败 → 尝试下一个)
+  后端2 (500 错误 → 记录失败 → 尝试下一个)
      ↓
- 后端3 (429 → 记录限流 → 尝试下一个)
+  后端3 (429 → 记录限流 → 尝试下一个)
      ↓
- 后端4 (成功) → 响应格式转换 → 返回客户端
+  后端4 (成功) → 返回客户端
 ```
-
-### 格式转换（OpenAI 后端）
-
-当后端配置为 `"api_type": "openai"` 时，代理会自动处理以下转换：
-
-**路径转换**：
-- 客户端请求：`POST /v1/messages`
-- OpenAI 后端：`POST /v1/chat/completions`
-- 日志标记：`[路径转换] backend_name - Claude 路径 /v1/messages -> OpenAI 路径 /v1/chat/completions`
-
-**请求转换（Claude → OpenAI）**：
-- 转换 `messages` 数组格式（content array → string/array）
-- 映射模型名称（如 `claude-3-5-sonnet` → `gpt-4o`）
-- 将 `system` 字段转换为系统消息
-- 日志标记：`[格式转换] backend_name - Claude 请求已转换为 OpenAI 格式`
-
-**响应转换（OpenAI → Claude）**：
-- 转换 `choices` → `content` 数组
-- 映射 `finish_reason` → `stop_reason`
-- 转换 `usage` 字段格式（prompt_tokens → input_tokens）
-- 自动检测：如果响应已是 Claude 格式，直接透传
-- 日志标记：`[格式转换] backend_name - OpenAI 响应已转换为 Claude 格式`
-
-**支持的模型映射**：
-- `claude-sonnet-4-5` / `claude-sonnet-4-5-thinking` → `gpt-4o`
-- `claude-3-opus` → `gpt-4-turbo`
-- `claude-3-sonnet` → `gpt-4`
-- `claude-3-haiku` → `gpt-3.5-turbo`
 
 ### 压缩处理
 
@@ -305,15 +238,13 @@ claude
 [流式完成] Backend1 - 处理完成 (共 15 行, 8 个数据块, 总字符数: 31)
 ```
 
-### 格式转换日志
+### 压缩日志
 
 ```
-[格式转换] Backend1 - Claude 请求已转换为 OpenAI 格式
 [readResponseBody] Content-Encoding 头: 'zstd'
 [readResponseBody] 检测到 zstd 压缩,尝试解压
 [readResponseBody] zstd 解压器创建成功
 [readResponseBody] 读取了 532 字节数据
-[格式检测] Backend1 - 响应已经是 Claude 格式,直接透传
 ```
 
 ### 熔断器和限流日志
@@ -338,7 +269,6 @@ claude
 - **实时流式内容**：流式响应的每个内容块都会实时显示
 - **完整内容累积**：流式传输结束后显示完整响应文本
 - **压缩检测**：详细记录压缩格式和解压过程
-- **格式转换**：清晰标注格式转换的每个步骤
 - **错误详情**：所有非 2xx 响应都会显示完整错误信息
 
 ## 高级用法
@@ -454,33 +384,6 @@ curl -X POST http://localhost:3456/v1/messages \
 - 新版本已支持魔术字节自动检测，无需声明也能正确解压
 - 如果仍有问题，查看日志确认压缩格式
 
-### 问题：OpenAI 后端返回错误
-
-**症状**：配置了 `api_type: "openai"` 但请求失败，返回 422 错误
-
-**可能原因**：
-1. **最常见**：后端实际期望的是 Claude API 格式，但配置中设置了 `api_type: "openai"`
-   - 错误信息示例：`"Input should be a valid string"` 或 `"loc":["body","messages",1,"content","str"]`
-   - 原因：代理把请求转换为 OpenAI 格式，但后端期望 Claude 格式
-2. 模型映射不正确
-3. 后端 URL 配置错误
-
-**排查方法**：
-1. 查看 `[错误详情]` 日志中的完整错误信息
-2. 查看 `[OpenAI 原始响应]` 日志
-3. 检查是否有 `[格式检测] - 响应已经是 Claude 格式,直接透传`
-4. 查看请求的 URL 是否正确
-
-**解决方案**：
-- **如果后端支持 Claude API 格式**（最常见情况）：
-  - 将配置中的 `api_type` 改为 `"claude"` 或删除该字段（使用默认值）
-  - 示例：很多第三方服务（如 iflow、OpenAI 代理等）虽然基于 OpenAI 模型，但提供 Claude API 兼容接口
-- **如果后端确实是 OpenAI API**：
-  - 确认 `base_url` 配置正确，通常应该包含 `/v1` 路径
-  - 例如：`"base_url": "https://api.openai.com/v1"`
-  - 代理会自动将 `/v1/messages` 转换为 `/v1/chat/completions`
-- 代理会自动检测响应格式，如果响应已是 Claude 格式会直接透传
-
 ### 问题：频繁出现 429 限流错误
 
 **症状**：日志频繁显示 `[限流记录]`
@@ -504,7 +407,7 @@ curl -X POST http://localhost:3456/v1/messages \
 
 - **内存占用**：约 10-20MB
 - **并发支持**：Go 原生并发，支持大量并发连接
-- **延迟**：代理转发延迟 < 5ms（Claude 后端），< 10ms（OpenAI 后端含格式转换）
+- **延迟**：代理转发延迟 < 5ms
 - **压缩性能**：zstd 解压速度比 gzip 快 2-5 倍
 
 ## 技术栈
@@ -516,7 +419,6 @@ curl -X POST http://localhost:3456/v1/messages \
 - **特性**：
   - 自动 gzip/zstd 解压
   - 优雅关闭支持（SIGINT/SIGTERM）
-  - 智能格式转换（Claude ↔ OpenAI）
   - 熔断器和限流状态管理
   - 流式响应实时处理
 
@@ -532,4 +434,3 @@ MIT License
 
 - [Claude Code 官方文档](https://code.claude.com/docs)
 - [Anthropic API 文档](https://docs.anthropic.com)
-- [OpenAI API 文档](https://platform.openai.com/docs)
