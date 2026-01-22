@@ -2,23 +2,33 @@
   "port": 3456,
   "backends": [
     {
-      "name": "backend-1",
-      "base_url": "https://api.example1.com",
+      "name": "anthropic-backend",
+      "base_url": "https://api.anthropic.com",
       "token": "sk-ant-xxx",
-      "enabled": true
-    },
-    {
-      "name": "backend-2",
-      "base_url": "https://api.example2.com",
-      "token": "sk-ant-yyy",
       "enabled": true,
-      "model": "claude-3-5-sonnet-20241022"
+      "platform": "anthropic"
     },
     {
-      "name": "backend-3",
-      "base_url": "https://api.example3.com",
-      "token": "sk-ant-zzz",
-      "enabled": false
+      "name": "openai-backend",
+      "base_url": "https://api.openai.com",
+      "token": "sk-openai-xxx",
+      "enabled": true,
+      "platform": "openai"
+    },
+    {
+      "name": "nvidia-openai-backend",
+      "base_url": "https://integrate.api.nvidia.com",
+      "token": "nv-xxx",
+      "enabled": true,
+      "platform": "openai",
+      "model": "meta/llama-3.1-405b-instruct"
+    },
+    {
+      "name": "disabled-backend",
+      "base_url": "https://api.example.com",
+      "token": "sk-disabled",
+      "enabled": false,
+      "platform": "anthropic"
     }
   ],
   "retry": {

@@ -2,11 +2,12 @@ package main
 
 // Backend represents an API backend configuration
 type Backend struct {
-	Name    string `json:"name"`
-	BaseURL string `json:"base_url"`
-	Enabled bool   `json:"enabled"`
-	Token   string `json:"token"`
-	Model   string `json:"model,omitempty"` // Optional: override model field in request
+	Name     string `json:"name"`
+	BaseURL  string `json:"base_url"`
+	Enabled  bool   `json:"enabled"`
+	Token    string `json:"token"`
+	Model    string `json:"model,omitempty"` // Optional: override model field in request
+	Platform string `json:"platform,omitempty"` // Platform type: "anthropic" (default) or "openai"
 }
 
 // Config represents configuration file structure

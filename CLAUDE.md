@@ -4,15 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a lightweight Claude API failover proxy written in Go. It provides automatic failover between multiple Claude API backends with circuit breaker, rate limit handling, and transparent request forwarding. When one backend fails, it automatically tries the next available backend without client intervention.
+This is a lightweight Claude API failover proxy written in Go. It provides automatic failover between multiple API backends (Claude and OpenAI compatible) with circuit breaker, rate limit handling, and transparent request forwarding. When one backend fails, it automatically tries the next available backend without client intervention.
 
 **Key Features:**
 - Automatic failover on 5xx/429 errors
 - Circuit breaker to prevent repeated requests to failed backends
 - Rate limit handling with cooldown periods
-- Support for Claude API backends
+- Support for both Claude API and OpenAI API backends
+- Bidirectional format conversion between Anthropic and OpenAI APIs
 - Compression support (gzip and zstd) with automatic detection
 - Streaming and non-streaming response handling
+- Path forwarding (e.g., `/v1/messages` → `/v1/chat/completions` for OpenAI)
 
 ## Build and Run Commands
 
@@ -53,14 +55,20 @@ The proxy is configured via `config.json` (JSON format). See `config.example.jso
 
 **Backend configuration:**
 - `name`: Backend identifier (used in logs)
-- `base_url`: API base URL (can include path, e.g., `https://api.example.com/v1` or `https://api.longcat.chat/anthropic`)
+- `base_url`: API base URL (can include path, e.g., `https://api.example.com` or `https://api.openai.com/v1`)
 - `token`: Actual API token (proxy sets `Authorization: Bearer <token>`)
 - `enabled`: Whether to use this backend
+- `platform`: Platform type - "anthropic" (default) or "openai"
 - `model` (optional): Override the "model" field in requests
 
 **Important**: `base_url` can include path components. The proxy will append the client request path to the base URL path. For example:
 - `base_url: "https://api.example.com"` + request `/v1/messages` = `https://api.example.com/v1/messages`
-- `base_url: "https://api.longcat.chat/anthropic"` + request `/v1/messages` = `https://api.longcat.chat/anthropic/v1/messages`
+- `base_url: "https://api.openai.com/v1"` + request `/v1/messages` = `https://api.openai.com/v1/v1/messages`
+
+**For OpenAI backends**: Set `platform: "openai"` and the proxy will automatically handle path forwarding:
+- Client requests `/v1/messages` → automatically forwarded to `/v1/chat/completions`
+- Use base URL without the endpoint: `base_url: "https://api.openai.com"`
+- The proxy will construct the final URL as: `https://api.openai.com/v1/chat/completions`
 
 **Optional configuration:**
 - `retry.timeout_seconds`: Request timeout for non-streaming requests
@@ -75,7 +83,7 @@ The proxy is configured via `config.json` (JSON format). See `config.example.jso
 - **main.go**: Server initialization, startup, graceful shutdown
 - **config.go**: Configuration structs (Backend, Config)
 - **config_loader.go**: JSON config file loading
-- **proxy.go**: Core request handling, response forwarding, compression handling
+- **proxy.go**: Core request handling, response forwarding, compression handling, format conversion
 - **circuit_breaker.go**: Circuit breaker and rate limit state management
 
 **Key dependencies:**
@@ -84,6 +92,7 @@ The proxy is configured via `config.json` (JSON format). See `config.example.jso
 
 **Note:** This project currently has no test suite. When adding new features, consider writing tests to verify behavior, especially for:
 - Circuit breaker state transitions (circuit_breaker.go)
+- Request/response format conversion (proxy.go)
 - Request/response handling edge cases
 
 ### Request Flow
@@ -93,17 +102,33 @@ The proxy is configured via `config.json` (JSON format). See `config.example.jso
 3. For each backend:
    - **CircuitBreaker.ShouldSkipBackend**: Check if backend should be skipped (disabled, circuit open, rate limit cooldown)
    - **forwardRequest**: Forward request to backend
+     - Detects platform type from `platform` field (default: "anthropic")
+     - For OpenAI backends: converts Anthropic format → OpenAI format
      - Detects streaming requests (`"stream": true` in request body)
      - Adds timeout context for non-streaming requests only
      - Replaces `Authorization` header with backend's token
    - On error/429/5xx: **CircuitBreaker.RecordFailure/Record429**, try next backend
-   - On success: **CircuitBreaker.RecordSuccess**, return response to client
+   - On success: **CircuitBreaker.RecordSuccess**, convert response if needed, return to client
 4. If all backends fail: Return 502 Bad Gateway
+
+### Format Conversion
+
+**Anthropic ↔ OpenAI Conversion:**
+- **Request conversion**: Anthropic `/v1/messages` format → OpenAI `/v1/chat/completions` format
+- **Response conversion**: OpenAI response format → Anthropic response format
+- **Streaming support**: Real-time conversion of streaming responses
+- **Multi-modal support**: Text, images, and tool calls
+
+**Key conversion functions:**
+- `convertAnthropicToOpenAI()`: Converts Anthropic requests to OpenAI format
+- `convertOpenAIToAnthropic()`: Converts OpenAI responses to Anthropic format
+- Handles system messages, user/assistant messages, tool calls, and tool results
 
 ### Response Handling
 
-The proxy uses direct response passthrough for all backends:
-- **copyResponse**: Direct passthrough with minimal overhead for all responses
+The proxy handles response conversion based on platform type:
+- **Anthropic backends**: Direct passthrough with minimal overhead
+- **OpenAI backends**: Convert OpenAI format → Anthropic format before returning to client
 
 ### Circuit Breaker (circuit_breaker.go)
 
@@ -142,6 +167,9 @@ All logs use Chinese for consistency. Key log prefixes:
 - `[尝试 #N]`: Which backend being tried
 - `[超时设置]`: Timeout configuration
 - `[模型覆盖]`: Model override applied
+- `[格式转换]`: Request/response format conversion
+- `[格式转换失败]`: Format conversion error
+- `[响应转换]`: Response format conversion
 - `[错误详情]`: Non-2xx response with body preview
 - `[成功 #N]`: Backend returned 2xx success
 - `[返回客户端]`: Backend returned 4xx client error (not retried)
@@ -155,9 +183,9 @@ All logs use Chinese for consistency. Key log prefixes:
 Request body is fully read into memory to enable retries across backends. Trade-off: higher memory usage for reliable failover.
 
 ### Streaming Response Handling
-For Claude API backends with streaming responses, the proxy:
-- Passes through responses directly without modification
-- All response data (headers, status, body) are forwarded as-is
+For streaming responses, the proxy:
+- **Anthropic backends**: Passes through responses directly without modification
+- **OpenAI backends**: Converts OpenAI streaming format to Anthropic streaming format in real-time
 
 ### Token Management
 - `token` field in config contains actual API token
@@ -169,6 +197,14 @@ If backend has `model` configured:
 - Proxy parses JSON request body
 - Replaces `model` field with backend's configured value
 - Logged as `[模型覆盖]`
+
+### Path Forwarding for OpenAI
+**Automatic path forwarding**: The proxy automatically handles path conversion for OpenAI backends:
+- ✅ Client requests `/v1/messages` → automatically forwarded to `/v1/chat/completions`
+- ✅ Use simple base URL: `base_url: "https://api.openai.com"`
+- ✅ Final URL: `https://api.openai.com/v1/chat/completions`
+
+The proxy handles this conversion automatically when `platform: "openai"` is set.
 
 ## Common Issues
 
@@ -182,6 +218,11 @@ If backend has `model` configured:
 - Check `[跳过]` logs to see if circuit is open
 - Failures must be from actual backend errors (5xx), not client errors (4xx except 429)
 
+**OpenAI format conversion errors:**
+- Check `[格式转换失败]` logs for conversion errors
+- Ensure OpenAI backend is properly configured with `platform: "openai"`
+- Verify base_url includes the correct endpoint path
+
 ## Code Modification Guidelines
 
 - **All response body reading** must use `readResponseBody()` helper (handles compression)
@@ -189,7 +230,8 @@ If backend has `model` configured:
 - **Logging**: Maintain Chinese convention for consistency with existing logs
 - **Circuit breaker logic**: Modify circuit_breaker.go if changing failover behavior
 - **Timeout handling**: Be aware of streaming vs non-streaming distinction
-- **URL path handling**: When modifying URL construction, use `targetURL.Path = targetURL.Path + originalReq.URL.Path` to preserve base_url paths (e.g., `/anthropic` in `https://api.longcat.chat/anthropic`)
+- **URL path handling**: When modifying URL construction, use `targetURL.Path = targetURL.Path + originalReq.URL.Path` to preserve base_url paths
+- **Format conversion**: Test conversion logic with both streaming and non-streaming requests
 
 ## Development Workflow
 
@@ -206,4 +248,5 @@ When making changes to the proxy:
 - Use the detailed Chinese logs to trace request flow through backends
 - Check token previews in logs to verify correct backend is being used
 - Monitor circuit breaker state transitions in logs
+- For OpenAI backends, verify `[格式转换]` and `[响应转换]` logs
 - The Authorization header in error logs is partially masked for security (shows first 15 and last 5 chars)
